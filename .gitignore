@@ -1,0 +1,3 @@
+libtoml.a
+*.o
+zig-cache
