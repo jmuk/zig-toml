@@ -63,21 +63,46 @@ pub const Parser = struct {
 
     fn parseInt(self: *Parser, input: []const u8, offset: usize, node: *Node) !usize {
         var i = offset;
+        var start = offset;
         var initial = true;
         var underscore_count: u64 = 0;
+        var base: u8 = 10;
         while (i < input.len) : (i+=1) {
             if (initial and (input[i] == '+' or input[i] == '-')) {
                 initial = false;
                 continue;
+            }
+            if (initial and input[i] == '0' and i+1 < input.len) {
+                var n = ascii.toLower(input[i+1]);
+                if (n == 'o' or n == 'x' or n == 'b') {
+                    initial = false;
+                    i += 1;
+                    start+=2;
+                    base = switch (n) {
+                        'x' => 16,
+                        'o' => 8,
+                        'b' => 2,
+                        else => undefined,
+                    };
+                    continue;
+                }
             }
             initial = false;
             if (input[i] == '_') {
                 underscore_count += 1;
                 continue;
             }
-            if (!ascii.isDigit(input[i])) {
-                break;
+
+            const c = input[i];
+            if (ascii.isDigit(c) and (c - '0') < base) {
+                continue;
             }
+            if (base > 10 and ascii.isAlpha(c) and (ascii.toLower(c) - 'a' + 10) < base) {
+                continue;
+            }
+            if (c == ' ' or c == '\t')
+                break;
+            return ParseError.FailedToParse;
         }
         if (i == offset) {
             return ParseError.FailedToParse;
@@ -89,8 +114,8 @@ pub const Parser = struct {
             self.allocator.free(buf_for_cleanup);
         };
         if (buf_allocated) {
-            buf_for_cleanup = try self.allocator.alloc(u8, i-offset-underscore_count);
-            var j = offset;
+            buf_for_cleanup = try self.allocator.alloc(u8, i-start-underscore_count);
+            var j = start;
             var p: usize = 0;
             while (j < i) : (j+=1) {
                 if (input[j] != '_') {
@@ -100,9 +125,9 @@ pub const Parser = struct {
             }
             buf = buf_for_cleanup;
         } else {
-            buf = input[offset..i];
+            buf = input[start..i];
         }
-        node.* = Node{.Int = try fmt.parseInt(i64, buf, 10)};
+        node.* = Node{.Int = try fmt.parseInt(i64, buf, base)};
         return i;
     }
 
@@ -246,6 +271,52 @@ test "parseInt" {
 
     expect((try parser.parseInt("+123_456_789", 0, &n)) == 12);
     expect(n.Int == 123456789);
+
+    expect((try parser.parseInt("0XFF", 0, &n)) == 4);
+    expect(n.Int == 255);
+
+    expect((try parser.parseInt("0Xa", 0, &n)) == 3);
+    expect(n.Int == 10);
+
+    expect((try parser.parseInt("0o20", 0, &n)) == 4);
+    expect(n.Int == 16);
+
+    expect((try parser.parseInt("0b0100", 0, &n)) == 6);
+    expect(n.Int == 4);
+
+    // hexadecimal with underscore.
+    expect((try parser.parseInt("0xa_1", 0, &n)) == 5);
+    expect(n.Int == 161);
+
+    // invalid octal.
+    expect(parser.parseInt("0o9", 0, &n) catch |err| e: {
+        expect(err == ParseError.FailedToParse);
+        break :e 0;
+    } == 0);
+
+    // invalid binary.
+    expect(parser.parseInt("0b2", 0, &n) catch |err| e: {
+        expect(err == ParseError.FailedToParse);
+        break :e 0;
+    } == 0);
+
+    // invalid hexadecimal.
+    expect(parser.parseInt("0xQ", 0, &n) catch |err| e: {
+        expect(err == ParseError.FailedToParse);
+        break :e 0;
+    } == 0);
+
+    // invalid prefix.
+    expect(parser.parseInt("0q0", 0, &n) catch |err| e: {
+        expect(err == ParseError.FailedToParse);
+        break :e 0;
+    } == 0);
+
+    // signs can't be combined with prefix.
+    expect(parser.parseInt("+0xdeadbeef", 0, &n) catch |err| e: {
+        expect(err == ParseError.FailedToParse);
+        break :e 0;
+    } == 0);
 }
 
 test "parseString" {
