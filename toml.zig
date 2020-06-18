@@ -106,6 +106,21 @@ pub const Parser = struct {
         return i;
     }
 
+    fn parseString(self: *Parser, input: []const u8, offset: usize, node: *Node) !usize {
+        if (input[offset] != '"') {
+            return ParseError.FailedToParse;
+        }
+        var start = offset+1;
+        var end = start;
+        while (end < input.len) : (end += 1) {
+            if (input[end] == '"') {
+                node.* = Node{.String = input[start..end]};
+                return end+1;
+            }
+        }
+        return ParseError.FailedToParse;
+    }
+
     const tokenResult = struct {
         token: []const u8,
         offset: usize
@@ -133,6 +148,7 @@ pub const Parser = struct {
         offset = self.skipSpaces(input, offset+1);
         var n = Node{.Bool = false};
         offset = try (
+            self.parseString(input, offset, &n) catch
             self.parseInt(input, offset, &n) catch 
             self.parseBool(input, offset, &n));
         _ = try data.put(key_result.token, n);
@@ -173,6 +189,18 @@ test "simple-kv" {
     defer parsed.deinit();
     expect(parsed.size == 1);
     expect(parsed.get("foo").?.value.Int == 42);
+}
+
+test "string-kv" {
+    var tester = testing.LeakCountAllocator.init(std.heap.page_allocator);
+    defer tester.validate() catch {};
+    var allocator = &tester.allocator;
+    var parser = try Parser.init(allocator);
+    defer allocator.destroy(parser);
+    var parsed = try parser.parse(" \t foo\t=  \"bar\"   \n");
+    defer parsed.deinit();
+    expect(parsed.size == 1);
+    expect(mem.eql(u8, parsed.get("foo").?.value.String, "bar"));
 }
 
 test "parseBool" {
@@ -218,4 +246,16 @@ test "parseInt" {
 
     expect((try parser.parseInt("+123_456_789", 0, &n)) == 12);
     expect(n.Int == 123456789);
+}
+
+test "parseString" {
+    var tester = testing.LeakCountAllocator.init(std.heap.page_allocator);
+    defer tester.validate() catch {};
+    var allocator = &tester.allocator;
+    var parser = try Parser.init(allocator);
+    defer allocator.destroy(parser);
+
+    var n: Node = .{.Bool = false};
+    expect((try parser.parseString("\"foo\"", 0, &n)) == 5);
+    expect(mem.eql(u8, n.String, "foo"));
 }
