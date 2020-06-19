@@ -9,6 +9,7 @@ const expect = testing.expect;
 pub const Node = union {
     String: []const u8,
     Int: i64,
+    Float: f64,
     Bool: bool,
 };
 
@@ -104,7 +105,7 @@ pub const Parser = struct {
                 break;
             return ParseError.FailedToParse;
         }
-        if (i == offset) {
+        if (i == start) {
             return ParseError.FailedToParse;
         }
         var buf: []const u8 = undefined;
@@ -128,6 +129,43 @@ pub const Parser = struct {
             buf = input[start..i];
         }
         node.* = Node{.Int = try fmt.parseInt(i64, buf, base)};
+        return i;
+    }
+
+    fn parseFloat(self: *Parser, input: []const u8, offset: usize, node: *Node) !usize {
+        var i = offset;
+        var has_e = false;
+        var has_num = false;
+        var has_dot = false;
+        var allow_sign = true;
+        while (i < input.len) : (i+=1) {
+            const c = input[i];
+            if (allow_sign and (c == '+' or c == '-')) {
+                allow_sign = false;
+                continue;
+            }
+            allow_sign = false;
+            if (has_num and !has_e and ascii.toLower(c) == 'e') {
+                has_e = true;
+                allow_sign = true;
+                continue;
+            }
+
+            if (ascii.isDigit(c)) {
+                has_num = true;
+                continue;
+            }
+
+            if (!has_dot and !has_e and c == '.') {
+                has_dot = true;
+                continue;
+            }
+            return ParseError.FailedToParse;
+        }
+        if (i == offset) {
+            return ParseError.FailedToParse;
+        }
+        node.* = Node{.Float = try fmt.parseFloat(f64, input[offset..i])};
         return i;
     }
 
@@ -175,6 +213,7 @@ pub const Parser = struct {
         offset = try (
             self.parseString(input, offset, &n) catch
             self.parseInt(input, offset, &n) catch 
+            self.parseFloat(input, offset, &n) catch
             self.parseBool(input, offset, &n));
         _ = try data.put(key_result.token, n);
         offset = self.skipSpaces(input, offset);
@@ -210,10 +249,11 @@ test "simple-kv" {
     var allocator = &tester.allocator;
     var parser = try Parser.init(allocator);
     defer allocator.destroy(parser);
-    var parsed = try parser.parse(" \t foo\t=  42   \n");
+    var parsed = try parser.parse(" \t foo\t=  42   \nbar= \t42.");
     defer parsed.deinit();
-    expect(parsed.size == 1);
+    expect(parsed.size == 2);
     expect(parsed.get("foo").?.value.Int == 42);
+    expect(parsed.get("bar").?.value.Float == 42);
 }
 
 test "string-kv" {
@@ -317,6 +357,26 @@ test "parseInt" {
         expect(err == ParseError.FailedToParse);
         break :e 0;
     } == 0);
+}
+
+test "parseFloat" {
+    var tester = testing.LeakCountAllocator.init(std.heap.page_allocator);
+    defer tester.validate() catch {};
+    var allocator = &tester.allocator;
+    var parser = try Parser.init(allocator);
+    defer allocator.destroy(parser);
+
+    var n: Node = .{.Bool = false};
+    expect((try parser.parseFloat("+1", 0, &n)) == 2);
+    expect(n.Float == 1);
+    expect((try parser.parseFloat("1.5", 0, &n)) == 3);
+    expect(n.Float == 1.5);
+    expect((try parser.parseFloat("-1e2", 0, &n)) == 4);
+    expect(n.Float == -1e2);
+    expect((try parser.parseFloat(".2e-1", 0, &n)) == 5);
+    expect(n.Float == 0.2e-1);
+    expect((try parser.parseFloat("1.e+2", 0, &n)) == 5);
+    expect(n.Float == 1e+2);
 }
 
 test "parseString" {
