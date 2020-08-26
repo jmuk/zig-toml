@@ -7,7 +7,7 @@ const testing = std.testing;
 const expect = testing.expect;
 
 pub const NodeTag = enum {
-    String, Int, Float, Bool, Object,
+    String, Int, Float, Bool, Object, Array,
 };
 
 pub const Node = union(NodeTag) {
@@ -16,6 +16,26 @@ pub const Node = union(NodeTag) {
     Float: f64,
     Bool: bool,
     Object: std.StringHashMap(Node),
+    Array: std.ArrayList(Node),
+
+    fn deinit(self: Node) void {
+        switch (self) {
+            Node.Object => |data| {
+                var i = data.iterator();
+                while (i.next()) |kv| {
+                    kv.value.deinit();
+                }
+                data.deinit();
+            },
+            Node.Array => |objs| {
+                for (objs.items) |item| {
+                    item.deinit();
+                }
+                objs.deinit();
+            },
+            else => {},
+        }
+    }
 };
 
 pub const ParseError = error {
@@ -25,10 +45,7 @@ pub const ParseError = error {
 pub fn deinit_r(data: std.StringHashMap(Node)) void {
     var i = data.iterator();
     while (i.next()) |kv| {
-        switch (kv.value) {
-            Node.Object => |subdata| deinit_r(subdata),
-            else => {},
-        }
+        kv.value.deinit();
     }
     data.deinit();
 }
@@ -249,21 +266,40 @@ pub const Parser = struct {
         if (input[offset] != '[') {
             return ParseError.FailedToParse;
         }
-        var key_result = try self.parseToken(input, offset+1);
-        offset = self.skipSpaces(input, key_result.offset);
-        if (input[offset] != ']') {
-            return ParseError.FailedToParse;
+        var count: usize = 1;
+        if (input[offset+count] == '[') {
+            count = 2;
         }
-        offset+=1;
+        var key_result = try self.parseToken(input, offset+count);
+        offset = self.skipSpaces(input, key_result.offset);
+        var i: usize = 0;
+        while (i < count) : (i += 1) {
+            if (input[offset+i] != ']') {
+                return ParseError.FailedToParse;
+            }
+        }
+        offset+=count;
         offset = self.skipSpaces(input, offset);
         if (input[offset] == '\n') {
             offset+=1;
         }
         var result = try data.getOrPut(key_result.token);
-        // TODO: check found_existing
-        result.kv.value = Node{.Object = std.StringHashMap(Node).init(self.allocator)};
+        var subdata: ?*std.StringHashMap(Node) = null;
+        if (count == 1) {
+            if (result.found_existing) {
+                return ParseError.FailedToParse;
+            }
+            result.kv.value = Node{.Object = std.StringHashMap(Node).init(self.allocator)};
+            subdata = &result.kv.value.Object;
+        } else {
+            if (!result.found_existing) {
+                result.kv.value = Node{.Array = std.ArrayList(Node).init(self.allocator)};
+            }
+            _ = try result.kv.value.Array.append(Node{.Object = std.StringHashMap(Node).init(self.allocator)});
+            subdata = &result.kv.value.Array.items[result.kv.value.Array.items.len-1].Object;
+        }
         return parseBracketResult{
-            .data = &result.kv.value.Object,
+            .data = subdata.?,
             .offset = offset,
         };
     }
@@ -334,6 +370,26 @@ test "bracket-kv" {
     expect(o1.get("bar").?.value.Int == 42);
     expect(o1.get("baz").?.value.Bool);
     var o2 = parsed.get("quox").?.value.Object;
+    expect(o2.size == 1);
+    expect(o2.get("bar").?.value.Int == 96);
+}
+
+test "double-bracket" {
+    var tester = testing.LeakCountAllocator.init(std.heap.page_allocator);
+    defer tester.validate() catch {};
+    var allocator = &tester.allocator;
+    var parser = try Parser.init(allocator);
+    defer allocator.destroy(parser);
+    var parsed = try parser.parse("[[foo]]\nbar=42\nbaz=true\n[[foo]]\nbar=96\n");
+    defer deinit_r(parsed);
+    expect(parsed.size == 1);
+    var a = parsed.get("foo").?.value.Array;
+    expect(a.items.len == 2);
+    var o1 = a.items[0].Object;
+    expect(o1.size == 2);
+    expect(o1.get("bar").?.value.Int == 42);
+    expect(o1.get("baz").?.value.Bool);
+    var o2 = a.items[1].Object;
     expect(o2.size == 1);
     expect(o2.get("bar").?.value.Int == 96);
 }
