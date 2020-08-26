@@ -58,6 +58,21 @@ pub const Parser = struct {
         return i;
     }
 
+    fn skipComment(self: *Parser, input: []const u8, offset: usize) usize {
+        if (offset >= input.len) {
+            return offset;
+        }
+        if (input[offset] != '#') {
+            return offset;
+        }
+        var i = offset;
+        while (i < input.len and input[i] != '\n') : (i+=1) {}
+        if (i < input.len) {
+            return i+1;
+        }
+        return i;
+    }
+
     fn parseTrue(self: *Parser, input: []const u8, offset: usize, value: *Value) ParseError!usize {
         if (offset+4 > input.len) {
             return ParseError.FailedToParse;
@@ -127,7 +142,7 @@ pub const Parser = struct {
             if (base > 10 and ascii.isAlpha(c) and (ascii.toLower(c) - 'a' + 10) < base) {
                 continue;
             }
-            if (ascii.isSpace(c))
+            if (ascii.isSpace(c) or c == '#')
                 break;
             return ParseError.FailedToParse;
         }
@@ -245,10 +260,6 @@ pub const Parser = struct {
             self.parseFloat(input, offset, &n) catch
             self.parseBool(input, offset, &n));
         _ = try data.put(key_result.token, n);
-        offset = self.skipSpaces(input, offset);
-        if (offset < input.len and input[offset] == '\n') {
-            offset+=1;
-        }
         return offset;
     }
 
@@ -274,10 +285,6 @@ pub const Parser = struct {
             }
         }
         offset+=count;
-        offset = self.skipSpaces(input, offset);
-        if (input[offset] == '\n') {
-            offset+=1;
-        }
         var result = try data.getOrPut(key_result.token);
         var subdata: ?*std.StringHashMap(Value) = null;
         if (count == 1) {
@@ -305,11 +312,21 @@ pub const Parser = struct {
         var offset: usize = 0;
         var data = &top;
         while (offset < input.len) {
+            offset = self.skipSpaces(input, offset);
+            offset = self.skipComment(input, offset);
+            if (offset >= input.len) {
+                break;
+            }
             if (self.parseBracket(input, offset, &top)) |result| {
                 data = result.data;
                 offset = result.offset;
             } else |_| {
                 offset = try self.parseAssign(input, offset, data);
+            }
+            offset = self.skipSpaces(input, offset);
+            offset = self.skipComment(input, offset);
+            if (offset < input.len and input[offset] == '\n') {
+                offset += 1;
             }
         }
         return Value{.Object = top};
@@ -332,7 +349,7 @@ test "simple-kv" {
     var allocator = &tester.allocator;
     var parser = try Parser.init(allocator);
     defer allocator.destroy(parser);
-    var parsed = try parser.parse(" \t foo\t=  42   \nbar= \t42.");
+    var parsed = try parser.parse(" \t foo\t=  42 # comment1  \nbar= \t42.");
     defer parsed.deinit();
     expect(parsed.Object.size == 2);
     expect(parsed.Object.get("foo").?.value.Int == 42);
@@ -345,7 +362,7 @@ test "string-kv" {
     var allocator = &tester.allocator;
     var parser = try Parser.init(allocator);
     defer allocator.destroy(parser);
-    var parsed = try parser.parse(" \t foo\t=  \"bar\"   \n");
+    var parsed = try parser.parse("#test\n \t foo\t=  \"bar\"   \n");
     defer parsed.deinit();
     expect(parsed.Object.size == 1);
     expect(mem.eql(u8, parsed.Object.get("foo").?.value.String.items, "bar"));
@@ -522,8 +539,8 @@ test "parseBracket" {
 
     var data = std.StringHashMap(Value).init(allocator);
     defer data.deinit();
-    var result = try parser.parseBracket("[foo]\n", 0, &data);
-    expect(result.offset == 6);
+    var result = try parser.parseBracket("[foo]", 0, &data);
+    expect(result.offset == 5);
     expect(data.size == 1);
     expect(&data.get("foo").?.value.Object == result.data);
 }
