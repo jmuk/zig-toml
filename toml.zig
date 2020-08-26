@@ -18,17 +18,17 @@ pub const Value = union(ValueTag) {
     Object: std.StringHashMap(Value),
     Array: std.ArrayList(Value),
 
-    fn deinit(self: Value) void {
+    pub fn deinit(self: Value) void {
         switch (self) {
-            Value.String => |str| str.deinit(),
-            Value.Object => |data| {
+            .String => |str| str.deinit(),
+            .Object => |data| {
                 var i = data.iterator();
                 while (i.next()) |kv| {
                     kv.value.deinit();
                 }
                 data.deinit();
             },
-            Value.Array => |objs| {
+            .Array => |objs| {
                 for (objs.items) |item| {
                     item.deinit();
                 }
