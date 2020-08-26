@@ -6,28 +6,29 @@ const mem = std.mem;
 const testing = std.testing;
 const expect = testing.expect;
 
-pub const NodeTag = enum {
+pub const ValueTag = enum {
     String, Int, Float, Bool, Object, Array,
 };
 
-pub const Node = union(NodeTag) {
-    String: []const u8,
+pub const Value = union(ValueTag) {
+    String: std.ArrayList(u8),
     Int: i64,
     Float: f64,
     Bool: bool,
-    Object: std.StringHashMap(Node),
-    Array: std.ArrayList(Node),
+    Object: std.StringHashMap(Value),
+    Array: std.ArrayList(Value),
 
-    fn deinit(self: Node) void {
+    fn deinit(self: Value) void {
         switch (self) {
-            Node.Object => |data| {
+            Value.String => |str| str.deinit(),
+            Value.Object => |data| {
                 var i = data.iterator();
                 while (i.next()) |kv| {
                     kv.value.deinit();
                 }
                 data.deinit();
             },
-            Node.Array => |objs| {
+            Value.Array => |objs| {
                 for (objs.items) |item| {
                     item.deinit();
                 }
@@ -41,14 +42,6 @@ pub const Node = union(NodeTag) {
 pub const ParseError = error {
     FailedToParse,
 };
-
-pub fn deinit_r(data: std.StringHashMap(Node)) void {
-    var i = data.iterator();
-    while (i.next()) |kv| {
-        kv.value.deinit();
-    }
-    data.deinit();
-}
 
 pub const Parser = struct {
     allocator: *std.mem.Allocator,
@@ -65,7 +58,7 @@ pub const Parser = struct {
         return i;
     }
 
-    fn parseTrue(self: *Parser, input: []const u8, offset: usize, node: *Node) ParseError!usize {
+    fn parseTrue(self: *Parser, input: []const u8, offset: usize, value: *Value) ParseError!usize {
         if (offset+4 > input.len) {
             return ParseError.FailedToParse;
         }
@@ -75,10 +68,10 @@ pub const Parser = struct {
         if (offset+4 < input.len and ascii.isAlNum(input[offset+4])) {
             return ParseError.FailedToParse;
         }
-        node.* = Node{.Bool = true};
+        value.* = Value{.Bool = true};
         return offset+4;
     }
-    fn parseFalse(self: *Parser, input: []const u8, offset: usize, node: *Node) ParseError!usize {
+    fn parseFalse(self: *Parser, input: []const u8, offset: usize, value: *Value) ParseError!usize {
         if (offset+5 > input.len) {
             return ParseError.FailedToParse;
         }        
@@ -88,14 +81,14 @@ pub const Parser = struct {
         if (offset+5 < input.len and ascii.isAlNum(input[offset+5])) {
             return ParseError.FailedToParse;
         }
-        node.* = Node{.Bool = false};
+        value.* = Value{.Bool = false};
         return offset+5;
     }
-    fn parseBool(self: *Parser, input: []const u8, offset: usize, node: *Node) ParseError!usize {
-        return self.parseTrue(input, offset, node) catch self.parseFalse(input, offset, node);
+    fn parseBool(self: *Parser, input: []const u8, offset: usize, value: *Value) ParseError!usize {
+        return self.parseTrue(input, offset, value) catch self.parseFalse(input, offset, value);
     }
 
-    fn parseInt(self: *Parser, input: []const u8, offset: usize, node: *Node) !usize {
+    fn parseInt(self: *Parser, input: []const u8, offset: usize, value: *Value) !usize {
         var i = offset;
         var start = offset;
         var initial = true;
@@ -161,11 +154,11 @@ pub const Parser = struct {
         } else {
             buf = input[start..i];
         }
-        node.* = Node{.Int = try fmt.parseInt(i64, buf, base)};
+        value.* = Value{.Int = try fmt.parseInt(i64, buf, base)};
         return i;
     }
 
-    fn parseFloat(self: *Parser, input: []const u8, offset: usize, node: *Node) !usize {
+    fn parseFloat(self: *Parser, input: []const u8, offset: usize, value: *Value) !usize {
         var i = offset;
         var has_e = false;
         var has_num = false;
@@ -198,11 +191,11 @@ pub const Parser = struct {
         if (i == offset) {
             return ParseError.FailedToParse;
         }
-        node.* = Node{.Float = try fmt.parseFloat(f64, input[offset..i])};
+        value.* = Value{.Float = try fmt.parseFloat(f64, input[offset..i])};
         return i;
     }
 
-    fn parseString(self: *Parser, input: []const u8, offset: usize, node: *Node) !usize {
+    fn parseString(self: *Parser, input: []const u8, offset: usize, value: *Value) !usize {
         if (input[offset] != '"') {
             return ParseError.FailedToParse;
         }
@@ -210,7 +203,9 @@ pub const Parser = struct {
         var end = start;
         while (end < input.len) : (end += 1) {
             if (input[end] == '"') {
-                node.* = Node{.String = input[start..end]};
+                var a = std.ArrayList(u8).init(self.allocator);
+                _ = try a.appendSlice(input[start..end]);
+                value.* = Value{.String = a};
                 return end+1;
             }
         }
@@ -235,7 +230,7 @@ pub const Parser = struct {
         return tokenResult{.token = input[offset..i], .offset = i};
     }
 
-    fn parseAssign(self: *Parser, input: []const u8, offset_in: usize, data: *std.StringHashMap(Node)) !usize {
+    fn parseAssign(self: *Parser, input: []const u8, offset_in: usize, data: *std.StringHashMap(Value)) !usize {
         var offset = self.skipSpaces(input, offset_in);
         var key_result = try self.parseToken(input, offset);
         offset = self.skipSpaces(input, key_result.offset);
@@ -243,7 +238,7 @@ pub const Parser = struct {
             return ParseError.FailedToParse;
         }
         offset = self.skipSpaces(input, offset+1);
-        var n = Node{.Bool = false};
+        var n = Value{.Bool = false};
         offset = try (
             self.parseString(input, offset, &n) catch
             self.parseInt(input, offset, &n) catch 
@@ -258,10 +253,10 @@ pub const Parser = struct {
     }
 
     const parseBracketResult = struct{
-        data: *std.StringHashMap(Node),
+        data: *std.StringHashMap(Value),
         offset: usize
     };
-    fn parseBracket(self: *Parser, input: []const u8, offset_in: usize, data: *std.StringHashMap(Node)) !parseBracketResult {
+    fn parseBracket(self: *Parser, input: []const u8, offset_in: usize, data: *std.StringHashMap(Value)) !parseBracketResult {
         var offset = self.skipSpaces(input, offset_in);
         if (input[offset] != '[') {
             return ParseError.FailedToParse;
@@ -284,18 +279,18 @@ pub const Parser = struct {
             offset+=1;
         }
         var result = try data.getOrPut(key_result.token);
-        var subdata: ?*std.StringHashMap(Node) = null;
+        var subdata: ?*std.StringHashMap(Value) = null;
         if (count == 1) {
             if (result.found_existing) {
                 return ParseError.FailedToParse;
             }
-            result.kv.value = Node{.Object = std.StringHashMap(Node).init(self.allocator)};
+            result.kv.value = Value{.Object = std.StringHashMap(Value).init(self.allocator)};
             subdata = &result.kv.value.Object;
         } else {
             if (!result.found_existing) {
-                result.kv.value = Node{.Array = std.ArrayList(Node).init(self.allocator)};
+                result.kv.value = Value{.Array = std.ArrayList(Value).init(self.allocator)};
             }
-            _ = try result.kv.value.Array.append(Node{.Object = std.StringHashMap(Node).init(self.allocator)});
+            _ = try result.kv.value.Array.append(Value{.Object = std.StringHashMap(Value).init(self.allocator)});
             subdata = &result.kv.value.Array.items[result.kv.value.Array.items.len-1].Object;
         }
         return parseBracketResult{
@@ -304,9 +299,9 @@ pub const Parser = struct {
         };
     }
 
-    pub fn parse(self: *Parser, input: []const u8) !std.StringHashMap(Node) {
-        var top = std.StringHashMap(Node).init(self.allocator);
-        errdefer deinit_r(top);
+    pub fn parse(self: *Parser, input: []const u8) !Value {
+        var top = std.StringHashMap(Value).init(self.allocator);
+        errdefer (Value{.Object = top}).deinit();
         var offset: usize = 0;
         var data = &top;
         while (offset < input.len) {
@@ -317,7 +312,7 @@ pub const Parser = struct {
                 offset = try self.parseAssign(input, offset, data);
             }
         }
-        return top;
+        return Value{.Object = top};
     }
 };
 
@@ -328,7 +323,7 @@ test "empty" {
     var parser = try Parser.init(allocator);
     defer allocator.destroy(parser);
     var parsed = try parser.parse("");
-    expect(parsed.size == 0);
+    expect(parsed.Object.size == 0);
 }
 
 test "simple-kv" {
@@ -338,10 +333,10 @@ test "simple-kv" {
     var parser = try Parser.init(allocator);
     defer allocator.destroy(parser);
     var parsed = try parser.parse(" \t foo\t=  42   \nbar= \t42.");
-    defer deinit_r(parsed);
-    expect(parsed.size == 2);
-    expect(parsed.get("foo").?.value.Int == 42);
-    expect(parsed.get("bar").?.value.Float == 42);
+    defer parsed.deinit();
+    expect(parsed.Object.size == 2);
+    expect(parsed.Object.get("foo").?.value.Int == 42);
+    expect(parsed.Object.get("bar").?.value.Float == 42);
 }
 
 test "string-kv" {
@@ -351,9 +346,9 @@ test "string-kv" {
     var parser = try Parser.init(allocator);
     defer allocator.destroy(parser);
     var parsed = try parser.parse(" \t foo\t=  \"bar\"   \n");
-    defer deinit_r(parsed);
-    expect(parsed.size == 1);
-    expect(mem.eql(u8, parsed.get("foo").?.value.String, "bar"));
+    defer parsed.deinit();
+    expect(parsed.Object.size == 1);
+    expect(mem.eql(u8, parsed.Object.get("foo").?.value.String.items, "bar"));
 }
 
 test "bracket-kv" {
@@ -363,13 +358,13 @@ test "bracket-kv" {
     var parser = try Parser.init(allocator);
     defer allocator.destroy(parser);
     var parsed = try parser.parse("[foo]\nbar=42\nbaz=true\n[quox]\nbar=96\n");
-    defer deinit_r(parsed);
-    expect(parsed.size == 2);
-    var o1 = parsed.get("foo").?.value.Object;
+    defer parsed.deinit();
+    expect(parsed.Object.size == 2);
+    var o1 = parsed.Object.get("foo").?.value.Object;
     expect(o1.size == 2);
     expect(o1.get("bar").?.value.Int == 42);
     expect(o1.get("baz").?.value.Bool);
-    var o2 = parsed.get("quox").?.value.Object;
+    var o2 = parsed.Object.get("quox").?.value.Object;
     expect(o2.size == 1);
     expect(o2.get("bar").?.value.Int == 96);
 }
@@ -381,9 +376,9 @@ test "double-bracket" {
     var parser = try Parser.init(allocator);
     defer allocator.destroy(parser);
     var parsed = try parser.parse("[[foo]]\nbar=42\nbaz=true\n[[foo]]\nbar=96\n");
-    defer deinit_r(parsed);
-    expect(parsed.size == 1);
-    var a = parsed.get("foo").?.value.Array;
+    defer parsed.deinit();
+    expect(parsed.Object.size == 1);
+    var a = parsed.Object.get("foo").?.value.Array;
     expect(a.items.len == 2);
     var o1 = a.items[0].Object;
     expect(o1.size == 2);
@@ -401,7 +396,7 @@ test "parseBool" {
     var parser = try Parser.init(allocator);
     defer allocator.destroy(parser);
 
-    var n: Node = .{.Int = 0};
+    var n: Value = .{.Int = 0};
     expect((try parser.parseBool("true", 0, &n)) == 4);
     expect(n.Bool);
     expect((try parser.parseBool("true   ", 0, &n)) == 4);
@@ -428,7 +423,7 @@ test "parseInt" {
     var parser = try Parser.init(allocator);
     defer allocator.destroy(parser);
 
-    var n: Node = .{.Bool = false};
+    var n: Value = .{.Bool = false};
     expect((try parser.parseInt("123", 0, &n)) == 3);
     expect(n.Int == 123);
 
@@ -492,7 +487,7 @@ test "parseFloat" {
     var parser = try Parser.init(allocator);
     defer allocator.destroy(parser);
 
-    var n: Node = .{.Bool = false};
+    var n: Value = .{.Bool = false};
     expect((try parser.parseFloat("+1", 0, &n)) == 2);
     expect(n.Float == 1);
     expect((try parser.parseFloat("1.5", 0, &n)) == 3);
@@ -512,9 +507,10 @@ test "parseString" {
     var parser = try Parser.init(allocator);
     defer allocator.destroy(parser);
 
-    var n: Node = .{.Bool = false};
+    var n: Value = .{.Bool = false};
+    defer n.deinit();
     expect((try parser.parseString("\"foo\"", 0, &n)) == 5);
-    expect(mem.eql(u8, n.String, "foo"));
+    expect(mem.eql(u8, n.String.items, "foo"));
 }
 
 test "parseBracket" {
@@ -524,8 +520,8 @@ test "parseBracket" {
     var parser = try Parser.init(allocator);
     defer allocator.destroy(parser);
 
-    var data = std.StringHashMap(Node).init(allocator);
-    defer deinit_r(data);
+    var data = std.StringHashMap(Value).init(allocator);
+    defer data.deinit();
     var result = try parser.parseBracket("[foo]\n", 0, &data);
     expect(result.offset == 6);
     expect(data.size == 1);
