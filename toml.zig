@@ -2,6 +2,7 @@ const std = @import("std");
 const ascii = std.ascii;
 const fmt = std.fmt;
 const mem = std.mem;
+const unicode = std.unicode;
 
 const testing = std.testing;
 const expect = testing.expect;
@@ -217,6 +218,7 @@ pub const Parser = struct {
         var start = offset+1;
         var end = start;
         var a = std.ArrayList(u8).init(self.allocator);
+        var upperSurrogate: ?u21 = null;
         errdefer a.deinit();
         while (end < input.len) : (end += 1) {
             if (input[end] == '\\') {
@@ -233,10 +235,39 @@ pub const Parser = struct {
                     '"' => try a.append('\"'),
                     '\\' => try a.append('\\'),
                     'u' => {
-                        // TBD,
+                        end+=1;
+                        if (end+4>input.len) {
+                            return ParseError.FailedToParse;
+                        }
+                        var chr = try fmt.parseInt(u21, input[end..(end+4)], 16);
+                        if (chr >= 0xd800 and chr <= 0xdfff) {
+                            // handling of surrogate pair.
+                            if (upperSurrogate) |us| {
+                                chr = (((us & 0x3ff) + 0x40) << 10) | (chr & 0x3ff);
+                                upperSurrogate = null;
+                            } else {
+                                upperSurrogate = chr;
+                                end+=3;
+                                continue;
+                            }
+                        }
+                        var buf: []u8 = try self.allocator.alloc(u8, try unicode.utf8CodepointSequenceLength(chr));
+                        defer self.allocator.free(buf);
+                        _ = try unicode.utf8Encode(chr, buf);
+                        _ = try a.appendSlice(buf);
+                        end+=3;
                     },
                     'U' => {
-                        // TBD,
+                        end+=1;
+                        if (end+8>input.len) {
+                            return ParseError.FailedToParse;
+                        }
+                        var chr = try fmt.parseInt(u21, input[end..(end+8)], 16);
+                        var buf: []u8 = try self.allocator.alloc(u8, try unicode.utf8CodepointSequenceLength(chr));
+                        defer self.allocator.free(buf);
+                        _ = try unicode.utf8Encode(chr, buf);
+                        _ = try a.appendSlice(buf);
+                        end+=7;
                     },
                     else => return ParseError.FailedToParse,
                 };
@@ -564,6 +595,19 @@ test "parseString-escape" {
     defer n.deinit();
     expect((try parser.parseString("\"\\b\\t\\n\\f\\r\\\"\\\\\"", 0, &n)) == 16);
     expect(mem.eql(u8, n.String.items, "\x08\t\n\x0c\r\"\\"));
+}
+
+test "parseString-escape-numerical" {
+    var tester = testing.LeakCountAllocator.init(std.heap.page_allocator);
+    defer tester.validate() catch {};
+    var allocator = &tester.allocator;
+    var parser = try Parser.init(allocator);
+    defer allocator.destroy(parser);
+
+    var n: Value = .{.Bool = false};
+    defer n.deinit();
+    expect((try parser.parseString("\"a\\u3042b\\U0001F600\\uD83D\\uDE00\"", 0, &n)) == 32);
+    expect(mem.eql(u8, n.String.items, "a\xe3\x81\x82b\xF0\x9F\x98\x80\xF0\x9F\x98\x80"));
 }
 
 test "parseBracket" {
