@@ -216,12 +216,35 @@ pub const Parser = struct {
         }
         var start = offset+1;
         var end = start;
+        var a = std.ArrayList(u8).init(self.allocator);
+        errdefer a.deinit();
         while (end < input.len) : (end += 1) {
-            if (input[end] == '"') {
-                var a = std.ArrayList(u8).init(self.allocator);
-                _ = try a.appendSlice(input[start..end]);
+            if (input[end] == '\\') {
+                if (end >= input.len-1) {
+                    return ParseError.FailedToParse;
+                }
+                end+=1;
+                _ = switch (input[end]) {
+                    'b' => try a.append('\x08'),
+                    't' => try a.append('\t'),
+                    'n' => try a.append('\n'),
+                    'f' => try a.append('\x0c'),
+                    'r' => try a.append('\r'),
+                    '"' => try a.append('\"'),
+                    '\\' => try a.append('\\'),
+                    'u' => {
+                        // TBD,
+                    },
+                    'U' => {
+                        // TBD,
+                    },
+                    else => return ParseError.FailedToParse,
+                };
+            } else if (input[end] == '"') {
                 value.* = Value{.String = a};
                 return end+1;
+            } else {
+                _ = try a.append(input[end]);
             }
         }
         return ParseError.FailedToParse;
@@ -528,6 +551,19 @@ test "parseString" {
     defer n.deinit();
     expect((try parser.parseString("\"foo\"", 0, &n)) == 5);
     expect(mem.eql(u8, n.String.items, "foo"));
+}
+
+test "parseString-escape" {
+    var tester = testing.LeakCountAllocator.init(std.heap.page_allocator);
+    defer tester.validate() catch {};
+    var allocator = &tester.allocator;
+    var parser = try Parser.init(allocator);
+    defer allocator.destroy(parser);
+
+    var n: Value = .{.Bool = false};
+    defer n.deinit();
+    expect((try parser.parseString("\"\\b\\t\\n\\f\\r\\\"\\\\\"", 0, &n)) == 16);
+    expect(mem.eql(u8, n.String.items, "\x08\t\n\x0c\r\"\\"));
 }
 
 test "parseBracket" {
