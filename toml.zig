@@ -211,13 +211,31 @@ pub const Parser = struct {
         return i;
     }
 
+    fn hasPrefix(s: []const u8, p: []const u8) bool {
+        if (s.len < p.len) {
+            return false;
+        }
+        for (p) |c, i| {
+            if (s[i] != c) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     fn parseString(self: *Parser, input: []const u8, offset: usize, value: *Value) !usize {
         if (input[offset] != '"') {
             return ParseError.FailedToParse;
         }
         var start = offset+1;
+        var multiLine = false;
+        if (hasPrefix(input[offset..], "\"\"")) {
+            start+=2;
+            multiLine = true;
+        }
         var end = start;
         var a = std.ArrayList(u8).init(self.allocator);
+        var inSkippingSpaces = false;
         var upperSurrogate: ?u21 = null;
         errdefer a.deinit();
         while (end < input.len) : (end += 1) {
@@ -234,6 +252,12 @@ pub const Parser = struct {
                     'r' => try a.append('\r'),
                     '"' => try a.append('\"'),
                     '\\' => try a.append('\\'),
+                    '\n' => {
+                        if (!multiLine) {
+                            return ParseError.FailedToParse;
+                        }
+                        inSkippingSpaces = true;
+                    },
                     'u' => {
                         end+=1;
                         if (end+4>input.len) {
@@ -271,10 +295,19 @@ pub const Parser = struct {
                     },
                     else => return ParseError.FailedToParse,
                 };
-            } else if (input[end] == '"') {
+            } else if (!multiLine and input[end] == '"') {
                 value.* = Value{.String = a};
                 return end+1;
+            } else if (multiLine and hasPrefix(input[end..], "\"\"\"")) {
+                value.* = Value{.String = a};
+                return end+3;
+            } else if (multiLine and inSkippingSpaces and (ascii.isSpace(input[end]) or input[end] == '\n')) {
+                // do nothing, skipping
+                continue;
+            } else if (input[end] == '\n' and !multiLine) {
+                return ParseError.FailedToParse;
             } else {
+                inSkippingSpaces = false;
                 _ = try a.append(input[end]);
             }
         }
@@ -608,6 +641,19 @@ test "parseString-escape-numerical" {
     defer n.deinit();
     expect((try parser.parseString("\"a\\u3042b\\U0001F600\\uD83D\\uDE00\"", 0, &n)) == 32);
     expect(mem.eql(u8, n.String.items, "a\xe3\x81\x82b\xF0\x9F\x98\x80\xF0\x9F\x98\x80"));
+}
+
+test "parseString-multi" {
+    var tester = testing.LeakCountAllocator.init(std.heap.page_allocator);
+    defer tester.validate() catch {};
+    var allocator = &tester.allocator;
+    var parser = try Parser.init(allocator);
+    defer allocator.destroy(parser);
+
+    var n: Value = .{.Bool = false};
+    defer n.deinit();
+    expect((try parser.parseString("\"\"\"aaa\nbbb\\\n  \n ccc\"\"\"", 0, &n)) == 22);
+    expect(mem.eql(u8, n.String.items, "aaa\nbbbccc"));
 }
 
 test "parseBracket" {
