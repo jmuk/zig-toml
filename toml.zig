@@ -314,6 +314,38 @@ pub const Parser = struct {
         return ParseError.FailedToParse;
     }
 
+    fn parseLiteralString(self: *Parser, input: []const u8, offset: usize, value: *Value) !usize {
+        if (input[offset] != '\'') {
+            return ParseError.FailedToParse;
+        }
+        var start = offset+1;
+        var multiLine = false;
+        if (hasPrefix(input[start..], "''")) {
+            start+=2;
+            multiLine = true;
+            if (input[start] == '\n') {
+                start+=1;
+            }
+        }
+        var end = start;
+        while (end < input.len) : (end += 1) {
+            if (!multiLine and input[end] == '\n') {
+                return ParseError.FailedToParse;
+            }
+            if ((multiLine and hasPrefix(input[end..], "'''")) or (!multiLine and input[end] == '\'')) {
+                var a = std.ArrayList(u8).init(self.allocator);
+                errdefer a.deinit();
+                _ = try a.appendSlice(input[start..end]);
+                value.* = Value{.String = a};
+                if (multiLine) {
+                    return end+3;
+                }
+                return end+1;
+            }
+        }
+        return ParseError.FailedToParse;
+    }
+
     const tokenResult = struct {
         token: []const u8,
         offset: usize
@@ -343,6 +375,7 @@ pub const Parser = struct {
         var n = Value{.Bool = false};
         offset = try (
             self.parseString(input, offset, &n) catch
+            self.parseLiteralString(input, offset, &n) catch
             self.parseInt(input, offset, &n) catch 
             self.parseFloat(input, offset, &n) catch
             self.parseBool(input, offset, &n));
@@ -654,6 +687,28 @@ test "parseString-multi" {
     defer n.deinit();
     expect((try parser.parseString("\"\"\"aaa\nbbb\\\n  \n ccc\"\"\"", 0, &n)) == 22);
     expect(mem.eql(u8, n.String.items, "aaa\nbbbccc"));
+}
+
+test "parseLiteralString" {
+    var tester = testing.LeakCountAllocator.init(std.heap.page_allocator);
+    defer tester.validate() catch {};
+    var allocator = &tester.allocator;
+    var parser = try Parser.init(allocator);
+    defer allocator.destroy(parser);
+
+    var n: Value = .{.Bool = false};
+    errdefer n.deinit();
+    expect((try parser.parseLiteralString("'\\\\ServerX\\admin$\\system32\\'", 0, &n)) == 28);
+    expect(mem.eql(u8, n.String.items, "\\\\ServerX\\admin$\\system32\\"));
+    n.deinit();
+
+    expect((try parser.parseLiteralString("'''\nThe first newline is\ntrimmed in raw strings.\n   All other whitespace\n   is preserved.\n'''", 0, &n)) == 93);
+    expect(mem.eql(u8, n.String.items, "The first newline is\ntrimmed in raw strings.\n   All other whitespace\n   is preserved.\n"));
+    n.deinit();
+
+    expect((try parser.parseLiteralString("''''That's still pointless', she said.'''", 0, &n)) == 41);
+    expect(mem.eql(u8, n.String.items, "'That's still pointless', she said."));
+    n.deinit();
 }
 
 test "parseBracket" {
