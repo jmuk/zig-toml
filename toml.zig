@@ -143,9 +143,10 @@ pub const Parser = struct {
             if (base > 10 and ascii.isAlpha(c) and (ascii.toLower(c) - 'a' + 10) < base) {
                 continue;
             }
-            if (ascii.isSpace(c) or c == '#')
-                break;
-            return ParseError.FailedToParse;
+            if (!ascii.isSpace(c) and ascii.isPrint(c)) {
+                return ParseError.FailedToParse;
+            }
+            break;
         }
         if (i == start) {
             return ParseError.FailedToParse;
@@ -364,6 +365,20 @@ pub const Parser = struct {
         return tokenResult{.token = input[offset..i], .offset = i};
     }
 
+    fn parseValue(self: *Parser, input: []const u8, offset_in: usize, v: *Value) !usize {
+        var offset = self.skipSpaces(input, offset_in);
+        if (input[offset] == '"') {
+            return self.parseString(input, offset, v);
+        } else if (input[offset] == '\'') {
+            return self.parseLiteralString(input, offset, v);
+        } else if (input[offset] == 'f') {
+            return self.parseFalse(input, offset, v);
+        } else if (input[offset] == 't') {
+            return self.parseTrue(input, offset, v);
+        }
+        return self.parseInt(input, offset, v) catch self.parseFloat(input, offset, v);
+    }
+
     fn parseAssign(self: *Parser, input: []const u8, offset_in: usize, data: *std.StringHashMap(Value)) !usize {
         var offset = self.skipSpaces(input, offset_in);
         var key_result = try self.parseToken(input, offset);
@@ -371,16 +386,12 @@ pub const Parser = struct {
         if (input[offset] != '=') {
             return ParseError.FailedToParse;
         }
-        offset = self.skipSpaces(input, offset+1);
-        var n = Value{.Bool = false};
-        offset = try (
-            self.parseString(input, offset, &n) catch
-            self.parseLiteralString(input, offset, &n) catch
-            self.parseInt(input, offset, &n) catch 
-            self.parseFloat(input, offset, &n) catch
-            self.parseBool(input, offset, &n));
-        _ = try data.put(key_result.token, n);
-        return offset;
+        var v = Value{.Bool = false};
+        var gpr = try data.getOrPut(key_result.token);
+        if (gpr.found_existing) {
+            return ParseError.FailedToParse;
+        }
+        return self.parseValue(input, offset+1, &gpr.kv.value);
     }
 
     const parseBracketResult = struct{
