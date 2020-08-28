@@ -59,6 +59,12 @@ pub const Parser = struct {
         return i;
     }
 
+    fn skipSpacesAndReturns(self: *Parser, input: []const u8, offset: usize) usize {
+        var i = offset;
+        while (ascii.isSpace(input[i])) : (i+=1) {}
+        return i;        
+    }
+
     fn skipComment(self: *Parser, input: []const u8, offset: usize) usize {
         if (offset >= input.len) {
             return offset;
@@ -143,7 +149,7 @@ pub const Parser = struct {
             if (base > 10 and ascii.isAlpha(c) and (ascii.toLower(c) - 'a' + 10) < base) {
                 continue;
             }
-            if (!ascii.isSpace(c) and ascii.isPrint(c)) {
+            if (ascii.isAlpha(c)) {
                 return ParseError.FailedToParse;
             }
             break;
@@ -203,9 +209,14 @@ pub const Parser = struct {
                 has_dot = true;
                 continue;
             }
-            return ParseError.FailedToParse;
+            if (ascii.isAlpha(c))
+                return ParseError.FailedToParse;
+            break;
         }
         if (i == offset) {
+            return ParseError.FailedToParse;
+        }
+        if (!has_dot and !has_e) {
             return ParseError.FailedToParse;
         }
         value.* = Value{.Float = try fmt.parseFloat(f64, input[offset..i])};
@@ -365,7 +376,31 @@ pub const Parser = struct {
         return tokenResult{.token = input[offset..i], .offset = i};
     }
 
-    fn parseValue(self: *Parser, input: []const u8, offset_in: usize, v: *Value) !usize {
+    fn parseArray(self: *Parser, input: []const u8, offset_in: usize, v: *Value) anyerror!usize {
+        if (input[offset_in] != '[') {
+            return ParseError.FailedToParse;
+        }
+        var offset = offset_in+1;
+        var arr = std.ArrayList(Value).init(self.allocator);
+        errdefer arr.deinit();
+        while (true) {
+            offset = self.skipSpacesAndReturns(input, offset);
+            var e = Value{.Bool = false};
+            offset = try self.parseValue(input, offset, &e);
+            _ = try arr.append(e);
+            offset = self.skipSpacesAndReturns(input, offset);
+            if (input[offset] == ']') {
+                v.* = Value{.Array = arr};
+                return offset+1;
+            } else if (input[offset] != ',') {
+                return ParseError.FailedToParse;
+            }
+            offset = self.skipSpacesAndReturns(input, offset+1);
+        }
+        return ParseError.FailedToParse;
+    }
+
+    fn parseValue(self: *Parser, input: []const u8, offset_in: usize, v: *Value) anyerror!usize {
         var offset = self.skipSpaces(input, offset_in);
         if (input[offset] == '"') {
             return self.parseString(input, offset, v);
@@ -375,8 +410,10 @@ pub const Parser = struct {
             return self.parseFalse(input, offset, v);
         } else if (input[offset] == 't') {
             return self.parseTrue(input, offset, v);
+        } else if (input[offset] == '[') {
+            return self.parseArray(input, offset, v);
         }
-        return self.parseInt(input, offset, v) catch self.parseFloat(input, offset, v);
+        return self.parseFloat(input, offset, v) catch self.parseInt(input, offset, v);
     }
 
     fn parseAssign(self: *Parser, input: []const u8, offset_in: usize, data: *std.StringHashMap(Value)) !usize {
@@ -636,8 +673,6 @@ test "parseFloat" {
     defer allocator.destroy(parser);
 
     var n: Value = .{.Bool = false};
-    expect((try parser.parseFloat("+1", 0, &n)) == 2);
-    expect(n.Float == 1);
     expect((try parser.parseFloat("1.5", 0, &n)) == 3);
     expect(n.Float == 1.5);
     expect((try parser.parseFloat("-1e2", 0, &n)) == 4);
@@ -735,4 +770,21 @@ test "parseBracket" {
     expect(result.offset == 5);
     expect(data.size == 1);
     expect(&data.get("foo").?.value.Object == result.data);
+}
+
+test "parseArray" {
+    var tester = testing.LeakCountAllocator.init(std.heap.page_allocator);
+    defer tester.validate() catch {};
+    var allocator = &tester.allocator;
+    var parser = try Parser.init(allocator);
+    defer allocator.destroy(parser);
+
+    var n: Value = .{.Bool = false};
+    defer n.deinit();
+    expect((try parser.parseArray("[ 42, 43.0,\n true, false ]", 0, &n)) == 26);
+    expect(n.Array.items.len == 4);
+    expect(n.Array.items[0].Int == 42);
+    expect(n.Array.items[1].Float == 43.0);
+    expect(n.Array.items[2].Bool);
+    expect(!n.Array.items[3].Bool);
 }
