@@ -23,7 +23,7 @@ fn hashKey(a: Key) u32 {
     return std.hash_map.hashString(a.items);
 }
 
-fn getS(tbl: Table, key: []const u8) ?*Table.KV {
+pub fn getS(tbl: Table, key: []const u8) ?*Table.KV {
     var a = Key.init(tbl.allocator);
     defer a.deinit();
     if (a.appendSlice(key)) |_| {
@@ -66,6 +66,7 @@ pub const Value = union(ValueTag) {
 pub const ParseError = error {
     FailedToParse,
     DuplicatedKey,
+    IncorrectDataType,
 };
 
 pub const Parser = struct {
@@ -85,7 +86,7 @@ pub const Parser = struct {
 
     fn skipSpacesAndReturns(self: *Parser, input: []const u8, offset: usize) usize {
         var i = offset;
-        while (ascii.isSpace(input[i])) : (i+=1) {}
+        while (i < input.len and ascii.isSpace(input[i])) : (i+=1) {}
         return i;        
     }
 
@@ -494,13 +495,21 @@ pub const Parser = struct {
             }
 
             if (gpr.found_existing) {
-                if (gpr.kv.value != .Table) {
-                    return ParseError.DuplicatedKey;
+                switch (gpr.kv.value) {
+                    .Table => curr = &gpr.kv.value.Table,
+                    .Array => |arr| {
+                        if (arr.items[arr.items.len-1] == .Table) {
+                            curr = &arr.items[arr.items.len-1].Table;
+                        } else {
+                            return ParseError.IncorrectDataType;
+                        }
+                    },
+                    else => return ParseError.IncorrectDataType,
                 }
             } else {
                 gpr.kv.value = Value{.Table = Table.init(self.allocator)};
+                curr = &gpr.kv.value.Table;
             }
-            curr = &gpr.kv.value.Table;
         }
         return ParseError.FailedToParse;
     }
@@ -572,11 +581,12 @@ pub const Parser = struct {
         var offset: usize = 0;
         var data = &top;
         while (offset < input.len) {
-            offset = self.skipSpaces(input, offset);
+            offset = self.skipSpacesAndReturns(input, offset);
             offset = self.skipComment(input, offset);
             if (offset >= input.len) {
                 break;
             }
+            offset = self.skipSpacesAndReturns(input, offset);
             if (self.parseBracket(input, offset, &top)) |result| {
                 data = result.data;
                 offset = result.offset;
@@ -585,13 +595,25 @@ pub const Parser = struct {
             }
             offset = self.skipSpaces(input, offset);
             offset = self.skipComment(input, offset);
-            if (offset < input.len and input[offset] == '\n') {
-                offset += 1;
-            }
+            offset = self.skipSpacesAndReturns(input, offset);
         }
         return Value{.Table = top};
     }
 };
+
+// helper for tests.
+fn checkS(tbl: Table, key: []const u8, e: []const u8) bool {
+    if (getS(tbl, key)) |kv| {
+        if (kv.value == .String) {
+            return mem.eql(u8, kv.value.String.items, e);
+        } else {
+            std.debug.warn("value {} is not a string\n", .{kv.value});
+        }
+    } else {
+        std.debug.warn("key {} not found\n", .{key});
+    }
+    return false;
+}
 
 test "empty" {
     var tester = testing.LeakCountAllocator.init(std.heap.page_allocator);
@@ -625,7 +647,7 @@ test "string-kv" {
     var parsed = try parser.parse("#test\n \t foo\t=  \"bar\"   \n");
     defer parsed.deinit();
     expect(parsed.Table.size == 1);
-    expect(mem.eql(u8, getS(parsed.Table, "foo").?.value.String.items, "bar"));
+    expect(checkS(parsed.Table, "foo", "bar"));
 }
 
 test "bracket-kv" {
@@ -664,6 +686,53 @@ test "double-bracket" {
     var o2 = a.items[1].Table;
     expect(o2.size == 1);
     expect(getS(o2, "bar").?.value.Int == 96);
+}
+
+test "double-bracket-subtable" {
+    var tester = testing.LeakCountAllocator.init(std.heap.page_allocator);
+    defer tester.validate() catch {};
+    var allocator = &tester.allocator;
+    var parser = try Parser.init(allocator);
+    defer allocator.destroy(parser);
+    var parsed = try parser.parse(
+        \\[[fruit]]
+        \\  name = "apple"
+        \\  [fruit.physical] # subtable
+        \\    color = "red"
+        \\    shape = "round"
+        \\
+        \\  [[fruit.variety]]
+        \\    name = "red delicious"
+        \\  [[fruit.variety]]
+        \\    name = "granny smith"
+        \\
+        \\[[fruit]]
+        \\  name = "banana"
+        \\  [[fruit.variety]]
+        \\    name = "plantain"
+    );
+    defer parsed.deinit();
+
+    expect(parsed.Table.size == 1);
+    var fruits = getS(parsed.Table, "fruit").?.value.Array;
+    expect(fruits.items.len == 2);
+    var apple = fruits.items[0].Table;
+    expect(apple.size == 3);
+    expect(checkS(apple, "name", "apple"));
+    var physical = getS(apple, "physical").?.value.Table;
+    expect(checkS(physical, "color", "red"));
+    expect(checkS(physical, "shape", "round"));
+    var varieties = getS(apple, "variety").?.value.Array;
+    expect(varieties.items.len == 2);
+    expect(checkS(varieties.items[0].Table, "name", "red delicious"));
+    expect(checkS(varieties.items[1].Table, "name", "granny smith"));
+
+    var banana = fruits.items[1].Table;
+    expect(banana.size == 2);
+    expect(checkS(banana, "name", "banana"));
+    varieties = getS(banana, "variety").?.value.Array;
+    expect(varieties.items.len == 1);
+    expect(checkS(varieties.items[0].Table, "name", "plantain"));
 }
 
 test "parseBool" {
