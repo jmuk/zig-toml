@@ -260,7 +260,7 @@ pub const Parser = struct {
         return true;
     }
 
-    fn parseString(self: *Parser, input: []const u8, offset: usize, value: *Value) !usize {
+    fn parseQuotedString(self: *Parser, input: []const u8, offset: usize, s: *Key) !usize {
         if (input[offset] != '"') {
             return ParseError.FailedToParse;
         }
@@ -271,10 +271,8 @@ pub const Parser = struct {
             multiLine = true;
         }
         var end = start;
-        var a = std.ArrayList(u8).init(self.allocator);
         var inSkippingSpaces = false;
         var upperSurrogate: ?u21 = null;
-        errdefer a.deinit();
         while (end < input.len) : (end += 1) {
             if (input[end] == '\\') {
                 if (end >= input.len-1) {
@@ -282,13 +280,13 @@ pub const Parser = struct {
                 }
                 end+=1;
                 _ = switch (input[end]) {
-                    'b' => try a.append('\x08'),
-                    't' => try a.append('\t'),
-                    'n' => try a.append('\n'),
-                    'f' => try a.append('\x0c'),
-                    'r' => try a.append('\r'),
-                    '"' => try a.append('\"'),
-                    '\\' => try a.append('\\'),
+                    'b' => try s.append('\x08'),
+                    't' => try s.append('\t'),
+                    'n' => try s.append('\n'),
+                    'f' => try s.append('\x0c'),
+                    'r' => try s.append('\r'),
+                    '"' => try s.append('\"'),
+                    '\\' => try s.append('\\'),
                     '\n' => {
                         if (!multiLine) {
                             return ParseError.FailedToParse;
@@ -315,7 +313,7 @@ pub const Parser = struct {
                         var buf: []u8 = try self.allocator.alloc(u8, try unicode.utf8CodepointSequenceLength(chr));
                         defer self.allocator.free(buf);
                         _ = try unicode.utf8Encode(chr, buf);
-                        _ = try a.appendSlice(buf);
+                        _ = try s.appendSlice(buf);
                         end+=3;
                     },
                     'U' => {
@@ -327,16 +325,14 @@ pub const Parser = struct {
                         var buf: []u8 = try self.allocator.alloc(u8, try unicode.utf8CodepointSequenceLength(chr));
                         defer self.allocator.free(buf);
                         _ = try unicode.utf8Encode(chr, buf);
-                        _ = try a.appendSlice(buf);
+                        _ = try s.appendSlice(buf);
                         end+=7;
                     },
                     else => return ParseError.FailedToParse,
                 };
             } else if (!multiLine and input[end] == '"') {
-                value.* = Value{.String = a};
                 return end+1;
             } else if (multiLine and hasPrefix(input[end..], "\"\"\"")) {
-                value.* = Value{.String = a};
                 return end+3;
             } else if (multiLine and inSkippingSpaces and (ascii.isSpace(input[end]) or input[end] == '\n')) {
                 // do nothing, skipping
@@ -345,13 +341,13 @@ pub const Parser = struct {
                 return ParseError.FailedToParse;
             } else {
                 inSkippingSpaces = false;
-                _ = try a.append(input[end]);
+                _ = try s.append(input[end]);
             }
         }
         return ParseError.FailedToParse;
     }
 
-    fn parseLiteralString(self: *Parser, input: []const u8, offset: usize, value: *Value) !usize {
+    fn parseLiteralString(self: *Parser, input: []const u8, offset: usize, s: *Key) !usize {
         if (input[offset] != '\'') {
             return ParseError.FailedToParse;
         }
@@ -370,10 +366,7 @@ pub const Parser = struct {
                 return ParseError.FailedToParse;
             }
             if ((multiLine and hasPrefix(input[end..], "'''")) or (!multiLine and input[end] == '\'')) {
-                var a = std.ArrayList(u8).init(self.allocator);
-                errdefer a.deinit();
-                _ = try a.appendSlice(input[start..end]);
-                value.* = Value{.String = a};
+                _ = try s.appendSlice(input[start..end]);
                 if (multiLine) {
                     return end+3;
                 }
@@ -383,11 +376,18 @@ pub const Parser = struct {
         return ParseError.FailedToParse;
     }
 
+    fn parseString(self: *Parser, input: []const u8, offset_in: usize, s: *Key) !usize {
+        if (input[offset_in] == '"') {
+            return self.parseQuotedString(input, offset_in, s);
+        }
+        return self.parseLiteralString(input, offset_in, s);
+    }
+
     const tokenResult = struct {
         token: []const u8,
         offset: usize
     };
-    fn parseToken(self: *Parser, input: []const u8, offset_in: usize) !tokenResult {
+    fn parseToken(self: *Parser, input: []const u8, offset_in: usize, s: *Key) !usize {
         var offset = self.skipSpaces(input, offset_in);
         var i: usize = offset;
         while (i < input.len) : (i+=1) {
@@ -399,14 +399,15 @@ pub const Parser = struct {
         if (i == offset) {
             return ParseError.FailedToParse;
         }
-        return tokenResult{.token = input[offset..i], .offset = i};
+        _ = try s.appendSlice(input[offset..i]);
+        return i;
     }
 
     const keyResult = struct {
-        keys: std.ArrayList(std.ArrayList(u8)),
+        keys: std.ArrayList(Key),
         offset: usize,
         fn init(allocator: *std.mem.Allocator) keyResult {
-            return .{ .keys = std.ArrayList(std.ArrayList(u8)).init(allocator), .offset = 0};
+            return .{ .keys = std.ArrayList(Key).init(allocator), .offset = 0};
         }
         fn deinit(self: keyResult) void {
             for (self.keys.items) |key| {
@@ -421,14 +422,19 @@ pub const Parser = struct {
         var offset = offset_in;
         while (offset < input.len) : (offset+=1) {
             offset = self.skipSpaces(input, offset);
-            var token = try parseToken(self, input, offset);
-            var tokenArr = std.ArrayList(u8).init(self.allocator);
-            tokenArr.appendSlice(token.token) catch |err| {
-                tokenArr.deinit();
-                return err;
-            };
+            var tokenArr = Key.init(self.allocator);
+            {
+                errdefer tokenArr.deinit();
+                if (input[offset] == '"') {
+                    offset = try self.parseQuotedString(input, offset, &tokenArr);
+                } else if (input[offset] == '\'') {
+                    offset = try self.parseLiteralString(input, offset, &tokenArr);
+                } else {
+                    offset = try self.parseToken(input, offset, &tokenArr);
+                }
+            }
             _ = try result.keys.append(tokenArr);
-            offset = self.skipSpaces(input, token.offset);
+            offset = self.skipSpaces(input, offset);
             if (offset >= input.len or input[offset] != '.') {
                 break;
             }
@@ -463,10 +469,12 @@ pub const Parser = struct {
 
     fn parseValue(self: *Parser, input: []const u8, offset_in: usize, v: *Value) anyerror!usize {
         var offset = self.skipSpaces(input, offset_in);
-        if (input[offset] == '"') {
-            return self.parseString(input, offset, v);
-        } else if (input[offset] == '\'') {
-            return self.parseLiteralString(input, offset, v);
+        if (input[offset] == '"' or input[offset] == '\'') {
+            var s = Key.init(self.allocator);
+            errdefer s.deinit();
+            offset = try self.parseString(input, offset, &s);
+            v.* = Value{.String = s};
+            return offset;
         } else if (input[offset] == 'f') {
             return self.parseFalse(input, offset, v);
         } else if (input[offset] == 't') {
@@ -851,10 +859,10 @@ test "parseString" {
     var parser = try Parser.init(allocator);
     defer allocator.destroy(parser);
 
-    var n: Value = .{.Bool = false};
-    defer n.deinit();
-    expect((try parser.parseString("\"foo\"", 0, &n)) == 5);
-    expect(mem.eql(u8, n.String.items, "foo"));
+    var s = Key.init(allocator);
+    defer s.deinit();
+    expect((try parser.parseString("\"foo\"", 0, &s)) == 5);
+    expect(mem.eql(u8, s.items, "foo"));
 }
 
 test "parseString-escape" {
@@ -864,10 +872,10 @@ test "parseString-escape" {
     var parser = try Parser.init(allocator);
     defer allocator.destroy(parser);
 
-    var n: Value = .{.Bool = false};
-    defer n.deinit();
-    expect((try parser.parseString("\"\\b\\t\\n\\f\\r\\\"\\\\\"", 0, &n)) == 16);
-    expect(mem.eql(u8, n.String.items, "\x08\t\n\x0c\r\"\\"));
+    var s = Key.init(allocator);
+    defer s.deinit();
+    expect((try parser.parseString("\"\\b\\t\\n\\f\\r\\\"\\\\\"", 0, &s)) == 16);
+    expect(mem.eql(u8, s.items, "\x08\t\n\x0c\r\"\\"));
 }
 
 test "parseString-escape-numerical" {
@@ -877,10 +885,10 @@ test "parseString-escape-numerical" {
     var parser = try Parser.init(allocator);
     defer allocator.destroy(parser);
 
-    var n: Value = .{.Bool = false};
-    defer n.deinit();
-    expect((try parser.parseString("\"a\\u3042b\\U0001F600\\uD83D\\uDE00\"", 0, &n)) == 32);
-    expect(mem.eql(u8, n.String.items, "a\xe3\x81\x82b\xF0\x9F\x98\x80\xF0\x9F\x98\x80"));
+    var s = Key.init(allocator);
+    defer s.deinit();
+    expect((try parser.parseString("\"a\\u3042b\\U0001F600\\uD83D\\uDE00\"", 0, &s)) == 32);
+    expect(mem.eql(u8, s.items, "a\xe3\x81\x82b\xF0\x9F\x98\x80\xF0\x9F\x98\x80"));
 }
 
 test "parseString-multi" {
@@ -890,10 +898,10 @@ test "parseString-multi" {
     var parser = try Parser.init(allocator);
     defer allocator.destroy(parser);
 
-    var n: Value = .{.Bool = false};
-    defer n.deinit();
-    expect((try parser.parseString("\"\"\"aaa\nbbb\\\n  \n ccc\"\"\"", 0, &n)) == 22);
-    expect(mem.eql(u8, n.String.items, "aaa\nbbbccc"));
+    var s = Key.init(allocator);
+    defer s.deinit();
+    expect((try parser.parseString("\"\"\"aaa\nbbb\\\n  \n ccc\"\"\"", 0, &s)) == 22);
+    expect(mem.eql(u8, s.items, "aaa\nbbbccc"));
 }
 
 test "parseLiteralString" {
@@ -903,19 +911,19 @@ test "parseLiteralString" {
     var parser = try Parser.init(allocator);
     defer allocator.destroy(parser);
 
-    var n: Value = .{.Bool = false};
-    errdefer n.deinit();
-    expect((try parser.parseLiteralString("'\\\\ServerX\\admin$\\system32\\'", 0, &n)) == 28);
-    expect(mem.eql(u8, n.String.items, "\\\\ServerX\\admin$\\system32\\"));
-    n.deinit();
+    var s = Key.init(allocator);
+    defer s.deinit();
+    expect((try parser.parseLiteralString("'\\\\ServerX\\admin$\\system32\\'", 0, &s)) == 28);
+    expect(mem.eql(u8, s.items, "\\\\ServerX\\admin$\\system32\\"));
+    _ = try s.resize(0);
 
-    expect((try parser.parseLiteralString("'''\nThe first newline is\ntrimmed in raw strings.\n   All other whitespace\n   is preserved.\n'''", 0, &n)) == 93);
-    expect(mem.eql(u8, n.String.items, "The first newline is\ntrimmed in raw strings.\n   All other whitespace\n   is preserved.\n"));
-    n.deinit();
+    expect((try parser.parseLiteralString("'''\nThe first newline is\ntrimmed in raw strings.\n   All other whitespace\n   is preserved.\n'''", 0, &s)) == 93);
+    expect(mem.eql(u8, s.items, "The first newline is\ntrimmed in raw strings.\n   All other whitespace\n   is preserved.\n"));
+    _ = try s.resize(0);
 
-    expect((try parser.parseLiteralString("''''That's still pointless', she said.'''", 0, &n)) == 41);
-    expect(mem.eql(u8, n.String.items, "'That's still pointless', she said."));
-    n.deinit();
+    expect((try parser.parseLiteralString("''''That's still pointless', she said.'''", 0, &s)) == 41);
+    expect(mem.eql(u8, s.items, "'That's still pointless', she said."));
+    _ = try s.resize(0);
 }
 
 test "parseKey" {
@@ -932,6 +940,21 @@ test "parseKey" {
     expect(mem.eql(u8, keys.keys.items[0].items, "abc"));
     expect(mem.eql(u8, keys.keys.items[1].items, "123"));
     expect(mem.eql(u8, keys.keys.items[2].items, "a-z"));
+}
+
+test "parseKey-quoted" {
+    var tester = testing.LeakCountAllocator.init(std.heap.page_allocator);
+    defer tester.validate() catch {};
+    var allocator = &tester.allocator;
+    var parser = try Parser.init(allocator);
+    defer allocator.destroy(parser);
+
+    var keys = try parser.parseKey("site.\"google.com\" = true", 0);
+    defer keys.deinit();
+    expect(keys.offset == 18);
+    expect(keys.keys.items.len == 2);
+    expect(mem.eql(u8, keys.keys.items[0].items, "site"));
+    expect(mem.eql(u8, keys.keys.items[1].items, "google.com"));
 }
 
 test "parseBracket" {
