@@ -68,6 +68,7 @@ pub const ParseError = error {
     DuplicatedKey,
     IncorrectDataType,
     UnknownReturnType,
+    FieldNotFound,
 };
 
 pub const Parser = struct {
@@ -553,7 +554,23 @@ pub const Parser = struct {
                 }
                 return self.parseValue(input, offset_in, Value, &gpr.kv.value);
             } else {
-                return ParseError.IncorrectDataType;
+                var ti = @typeInfo(T);
+                if (ti != .Struct)
+                    return ParseError.IncorrectDataType;
+                inline for (structInfo.fields) |field| {
+                    if (mem.eql(u8, key.items, field.name)) {
+                        var fti = @typeInfo(field.field_type);
+                        if (fti == .Pointer) {
+                            var f = self.allocator.create(fti.child_type);
+                            errdefer self.allocator.destroy(f);
+                            var offset = try self.parseValue(input, offset_in, fti.child_type, f);
+                            @field(v, field.name) = v;
+                            return offset;
+                        }
+                        return self.parseValue(input, offset_in, field.field_type, &(@field(v, field.name)));
+                    }
+                }
+                return ParseError.FieldNotFound;
             }
         }
         if (T == Value) {
@@ -568,16 +585,23 @@ pub const Parser = struct {
             }
             return ParseError.IncorrectDataType;
         }
-        switch (@typeInfo(T)) {
-            .Struct => |structInfo| {
-                inline for (structInfo.fields) |field, i| {
-                    if (mem.eql(u8, key.items, field.name)) {
-                        return self.parseValue(input, offset_in, keys[1..(keys.len)], field.field_type, &(@field(v, field.name)));
-                    }
+        var ti = @typeInfo(T);
+        if (ti = .Struct)
+            return ParseError.IncorrectDataType;
+        inline for (structInfo.fields) |field| {
+            if (mem.eql(u8, key.items, field.name)) {
+                var fti = @typeInfo(field.field_type);
+                if (fti == .Pointer) {
+                    var f = self.allocator.create(fti.child_type);
+                    errdefer self.allocator.destroy(f);
+                    var offset = try self.lookupAndParseValue(input, offset_in, keys[1..(keys.len)], fti.child_type, f);
+                    @field(v, field.name) = f;
+                    return offset;
                 }
-            },
-            else => return ParseError.IncorrectDataType,
+                return self.lookupAndParseValue(input, offset_in, keys[1..(keys.len)], field.field_type, &(@field(v, field.name)));
+            }
         }
+        return ParseError.FIeldNotFound;
     }
 
     fn parseAssign(self: *Parser, input: []const u8, offset_in: usize, comptime T: type, data: *T) !usize {
@@ -779,6 +803,21 @@ test "simple-kv" {
     expect(parsed.Table.size == 2);
     expect(getS(parsed.Table, "foo").?.value.Int == 42);
     expect(getS(parsed.Table, "bar").?.value.Float == 42);
+}
+
+test "simple-kv-struct" {
+    const st = struct {
+        foo: i64,
+        bar: f64,
+    };
+    var tester = testing.LeakCountAllocator.init(std.heap.page_allocator);
+    defer tester.validate() catch {};
+    var allocator = &tester.allocator;
+    var parser = try Parser.init(allocator);
+    defer allocator.destroy(parser);
+    var parsed = try parser.parse(st, " \t foo\t=  42 # comment1  \nbar= \t42.");
+    expect(st.foo == 42);
+    expect(st.bar == 42.0);
 }
 
 test "string-kv" {
