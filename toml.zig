@@ -67,6 +67,7 @@ pub const ParseError = error {
     FailedToParse,
     DuplicatedKey,
     IncorrectDataType,
+    UnknownReturnType,
 };
 
 pub const Parser = struct {
@@ -105,7 +106,19 @@ pub const Parser = struct {
         return i;
     }
 
-    fn parseTrue(self: *Parser, input: []const u8, offset: usize, value: *Value) ParseError!usize {
+    fn skipSpacesAndComments(self: *Parser, input: []const u8, offset: usize) usize {
+        var i = offset;
+        while (i < input.len) : (i+=1) {
+            if (input[i] == '#') {
+                while (i < input.len and input[i] != '\n') : (i+=1) {}
+            } else if (!ascii.isSpace(input[i])) {
+                return i;
+            }
+        }
+        return i;
+    }
+
+    fn parseTrue(self: *Parser, input: []const u8, offset: usize, value: *bool) ParseError!usize {
         if (offset+4 > input.len) {
             return ParseError.FailedToParse;
         }
@@ -115,10 +128,10 @@ pub const Parser = struct {
         if (offset+4 < input.len and ascii.isAlNum(input[offset+4])) {
             return ParseError.FailedToParse;
         }
-        value.* = Value{.Bool = true};
+        value.* = true;
         return offset+4;
     }
-    fn parseFalse(self: *Parser, input: []const u8, offset: usize, value: *Value) ParseError!usize {
+    fn parseFalse(self: *Parser, input: []const u8, offset: usize, value: *bool) ParseError!usize {
         if (offset+5 > input.len) {
             return ParseError.FailedToParse;
         }        
@@ -128,14 +141,14 @@ pub const Parser = struct {
         if (offset+5 < input.len and ascii.isAlNum(input[offset+5])) {
             return ParseError.FailedToParse;
         }
-        value.* = Value{.Bool = false};
+        value.* = false;
         return offset+5;
     }
-    fn parseBool(self: *Parser, input: []const u8, offset: usize, value: *Value) ParseError!usize {
+    fn parseBool(self: *Parser, input: []const u8, offset: usize, value: *bool) ParseError!usize {
         return self.parseTrue(input, offset, value) catch self.parseFalse(input, offset, value);
     }
 
-    fn parseInt(self: *Parser, input: []const u8, offset: usize, value: *Value) !usize {
+    fn parseInt(self: *Parser, input: []const u8, offset: usize, value: *i64) !usize {
         var i = offset;
         var start = offset;
         var initial = true;
@@ -202,11 +215,11 @@ pub const Parser = struct {
         } else {
             buf = input[start..i];
         }
-        value.* = Value{.Int = try fmt.parseInt(i64, buf, base)};
+        value.* = try fmt.parseInt(i64, buf, base);
         return i;
     }
 
-    fn parseFloat(self: *Parser, input: []const u8, offset: usize, value: *Value) !usize {
+    fn parseFloat(self: *Parser, input: []const u8, offset: usize, value: *f64) !usize {
         var i = offset;
         var has_e = false;
         var has_num = false;
@@ -244,7 +257,7 @@ pub const Parser = struct {
         if (!has_dot and !has_e) {
             return ParseError.FailedToParse;
         }
-        value.* = Value{.Float = try fmt.parseFloat(f64, input[offset..i])};
+        value.* = try fmt.parseFloat(f64, input[offset..i]);
         return i;
     }
 
@@ -443,104 +456,211 @@ pub const Parser = struct {
         return result;
     }
 
-    fn parseArray(self: *Parser, input: []const u8, offset_in: usize, v: *Value) anyerror!usize {
+    fn parseArray(self: *Parser, input: []const u8, offset_in: usize, comptime T: type, v: *std.ArrayList(T)) anyerror!usize {
         if (input[offset_in] != '[') {
             return ParseError.FailedToParse;
         }
         var offset = offset_in+1;
-        var arr = std.ArrayList(Value).init(self.allocator);
-        errdefer arr.deinit();
         while (true) {
-            offset = self.skipSpacesAndReturns(input, offset);
-            var e = Value{.Bool = false};
-            offset = try self.parseValue(input, offset, &e);
-            _ = try arr.append(e);
-            offset = self.skipSpacesAndReturns(input, offset);
+            offset = self.skipSpacesAndComments(input, offset);
+            var e = try self.createT(T);
+            errdefer self.destroyT(T, e);
+            offset = try self.parseValue(input, offset, T, &e);
+            _ = try v.append(e);
+            offset = self.skipSpacesAndComments(input, offset);
             if (input[offset] == ']') {
-                v.* = Value{.Array = arr};
                 return offset+1;
             } else if (input[offset] != ',') {
                 return ParseError.FailedToParse;
             }
-            offset = self.skipSpacesAndReturns(input, offset+1);
+            offset = self.skipSpacesAndComments(input, offset+1);
         }
         return ParseError.FailedToParse;
     }
 
-    fn parseValue(self: *Parser, input: []const u8, offset_in: usize, v: *Value) anyerror!usize {
+    fn parseValue(self: *Parser, input: []const u8, offset_in: usize, comptime T: type, v: *T) !usize {
         var offset = self.skipSpaces(input, offset_in);
-        if (input[offset] == '"' or input[offset] == '\'') {
+        if (T == Value) {
+            if (input[offset] == '"' or input[offset] == '\'') {
+                var s = Key.init(self.allocator);
+                errdefer s.deinit();
+                offset = try self.parseString(input, offset, &s);
+                v.* = Value{.String = s};
+                return offset;
+            } else if (input[offset] == 'f' or input[offset] == 't') {
+                var b = false;
+                offset = try self.parseBool(input, offset, &b);
+                v.* = Value{.Bool = b};
+                return offset;
+            } else if (input[offset] == '[') {
+                var a = std.ArrayList(Value).init(self.allocator);
+                errdefer a.deinit();
+                offset = try self.parseArray(input, offset, Value, &a);
+                v.* = Value{.Array = a};
+                return offset;
+            }
+            var f: f64 = 0.0;
+            if (self.parseFloat(input, offset, &f)) |offset_out| {
+                v.* = Value{.Float = f};
+                return offset_out;
+            } else |err| {
+                var i: i64 = 0;
+                offset = try self.parseInt(input, offset, &i);
+                v.* = Value{.Int = i};
+                return offset;
+            }
+        }
+        if (T == Key) {
             var s = Key.init(self.allocator);
             errdefer s.deinit();
             offset = try self.parseString(input, offset, &s);
             v.* = Value{.String = s};
             return offset;
-        } else if (input[offset] == 'f') {
-            return self.parseFalse(input, offset, v);
-        } else if (input[offset] == 't') {
-            return self.parseTrue(input, offset, v);
-        } else if (input[offset] == '[') {
-            return self.parseArray(input, offset, v);
         }
-        return self.parseFloat(input, offset, v) catch self.parseInt(input, offset, v);
+        switch (@typeInfo(T)) {
+            .Bool => return self.parseBool(input, offset, v),
+            .Int => return self.parseInt(input, offset, v),
+            .Float => return self.parseFloat(input, offset, v),
+            .Array => |arr| {
+                if (arr.child_type == u8) {
+                    var s = Key.init(self.allocator);
+                    errdefer s.deinit();
+                    offset = try self.parseString(input, offset, &s);
+                    v.* = s.items;
+                    return offset;
+                }
+            },
+            else => return ParseError.IncorrectDataType,
+            // TODO: struct
+        }
+
     }
 
-    fn getOrPutRecursive(self: *Parser, data: *Table, keys: std.ArrayList(std.ArrayList(u8))) !Table.GetOrPutResult {
-        var curr = data;
-        for (keys.items) |key, i| {
-            var gpr = curr.getOrPut(key) catch |err| {
-                var j = i;
-                while (j < keys.items.len) : (j+=1) {
-                    keys.items[j].deinit();
+    fn lookupAndParseValue(self: *Parser, input: []const u8, offset_in: usize, keys: []Key, comptime T: type, v: *T) anyerror!usize {
+        var key = keys[0];
+        errdefer for (keys[1..(keys.len)]) |k| {
+            k.deinit();
+        };
+        if (keys.len == 1) {
+            if (T == Value) {
+                if (v.* != .Table) {
+                    return ParseError.IncorrectDataType;
                 }
-                return err;
-            };
-            if (gpr.found_existing) {
-                key.deinit();
-            }
-            if (i == keys.items.len - 1) {
-                return gpr;
-            }
-
-            if (gpr.found_existing) {
-                switch (gpr.kv.value) {
-                    .Table => curr = &gpr.kv.value.Table,
-                    .Array => |arr| {
-                        if (arr.items[arr.items.len-1] == .Table) {
-                            curr = &arr.items[arr.items.len-1].Table;
-                        } else {
-                            return ParseError.IncorrectDataType;
-                        }
-                    },
-                    else => return ParseError.IncorrectDataType,
+                var gpr = try v.*.Table.getOrPut(key);
+                if (gpr.found_existing) {
+                    key.deinit();
+                    return ParseError.DuplicatedKey;
                 }
+                return self.parseValue(input, offset_in, Value, &gpr.kv.value);
             } else {
-                gpr.kv.value = Value{.Table = Table.init(self.allocator)};
-                curr = &gpr.kv.value.Table;
+                return ParseError.IncorrectDataType;
             }
         }
-        return ParseError.FailedToParse;
+        if (T == Value) {
+            if (v.* == .Table) {
+                var gpr = try v.*.Table.getOrPut(key);
+                if (gpr.found_existing) {
+                    key.deinit();
+                } else {
+                    gpr.kv.value = Value{.Table = Table.init(self.allocator)};
+                }
+                return self.lookupAndParseValue(input, offset_in, keys[1..(keys.len)], Value, &gpr.kv.value);
+            }
+            return ParseError.IncorrectDataType;
+        }
+        switch (@typeInfo(T)) {
+            .Struct => |structInfo| {
+                inline for (structInfo.fields) |field, i| {
+                    if (mem.eql(u8, key.items, field.name)) {
+                        return self.parseValue(input, offset_in, keys[1..(keys.len)], field.field_type, &(@field(v, field.name)));
+                    }
+                }
+            },
+            else => return ParseError.IncorrectDataType,
+        }
     }
 
-    fn parseAssign(self: *Parser, input: []const u8, offset_in: usize, data: *Table) !usize {
+    fn parseAssign(self: *Parser, input: []const u8, offset_in: usize, comptime T: type, data: *T) !usize {
         var keys = try self.parseKey(input, offset_in);
         defer keys.keys.deinit();
         if (input[keys.offset] != '=') {
             keys.deinit();
             return ParseError.FailedToParse;
         }
-        var gpr = try self.getOrPutRecursive(data, keys.keys);
-        if (gpr.found_existing) {
-            return ParseError.DuplicatedKey;
-        }
-        return self.parseValue(input, keys.offset+1, &gpr.kv.value);
+        return self.lookupAndParseValue(input, keys.offset+1, keys.keys.items, T, data);
     }
 
     const parseBracketResult = struct{
         data: *Table,
         offset: usize
     };
-    fn parseBracket(self: *Parser, input: []const u8, offset_in: usize, data: *Table) !parseBracketResult {
+
+    fn lookupAndParseKVs(self: *Parser, input: []const u8, offset_in: usize, keys: []Key, is_array: bool, comptime T: type, data: *T) !usize {
+        var key = keys[0];
+        errdefer for (keys[1..(keys.len)]) |k| {
+            k.deinit();
+        };
+        if (keys.len == 1) {
+            if (T == Value) {
+                if (data.* != .Table) {
+                    return ParseError.IncorrectDataType;   
+                }
+                var gpr = try data.Table.getOrPut(key);
+                if (gpr.found_existing) {
+                    key.deinit();
+                    if (gpr.kv.value == .Array) {
+                        if (!is_array) {
+                            return ParseError.IncorrectDataType;
+                        }
+                        var v = Value{.Table = Table.init(self.allocator)};
+                        errdefer v.deinit();
+                        var offset = try self.parseKVs(input, offset_in, Value, &v);
+                        _ = try gpr.kv.value.Array.append(v);
+                        return offset;
+                    }
+                    return ParseError.IncorrectDataType;
+                }
+                if (is_array) {
+                    var v = Value{.Table = Table.init(self.allocator)};
+                    errdefer v.deinit();
+                    var offset = try self.parseKVs(input, offset_in, Value, &v);
+                    var a = std.ArrayList(Value).init(self.allocator);
+                    errdefer a.deinit();
+                    _ = try a.append(v);
+                    gpr.kv.value = Value{.Array = a};
+                    return offset;
+                }
+                gpr.kv.value = Value{.Table = Table.init(self.allocator)};
+                errdefer gpr.kv.value.deinit();
+                return self.parseKVs(input, offset_in, Value, &gpr.kv.value);
+            } else {
+                return ParseError.IncorrectDataType;
+            }
+        }
+
+        if (T == Value) {
+            if (data.* != .Table) {
+                return ParseError.IncorrectDataType;   
+            }
+            var gpr = try data.Table.getOrPut(key);
+
+            if (gpr.found_existing) {
+                key.deinit();
+                if (gpr.kv.value == .Array) {
+                    var idx = gpr.kv.value.Array.items.len-1;
+                    return self.lookupAndParseKVs(input, offset_in, keys[1..(keys.len)], is_array, T, &gpr.kv.value.Array.items[idx]);
+                }
+                return self.lookupAndParseKVs(input, offset_in, keys[1..(keys.len)], is_array, T, &gpr.kv.value);
+            }
+            gpr.kv.value = Value{.Table = Table.init(self.allocator)};
+            errdefer gpr.kv.value.deinit();
+            return self.lookupAndParseKVs(input, offset_in, keys[1..(keys.len)], is_array, T, &gpr.kv.value);
+        } else {
+            return ParseError.IncorrectDataType;
+        }
+    }
+
+    fn parseBracket(self: *Parser, input: []const u8, offset_in: usize, comptime T: type, data: *T) !usize {
         var offset = self.skipSpaces(input, offset_in);
         if (input[offset] != '[') {
             return ParseError.FailedToParse;
@@ -559,53 +679,68 @@ pub const Parser = struct {
             }
         }
         offset = keys.offset+count;
-        var gpr = try self.getOrPutRecursive(data, keys.keys);
-        var subdata: ?*Table = null;
-        if (count == 1) {
-            if (gpr.found_existing and gpr.kv.value == .Array) {
-                subdata = &gpr.kv.value.Array.items[gpr.kv.value.Array.items.len-1].Table;
-            } else {
-                if (!gpr.found_existing) {
-                    gpr.kv.value = Value{.Table = Table.init(self.allocator)};
-                }
-                subdata = &gpr.kv.value.Table;
-            }
-        } else {
-            if (!gpr.found_existing) {
-                gpr.kv.value = Value{.Array = std.ArrayList(Value).init(self.allocator)};
-            }
-            _ = try gpr.kv.value.Array.append(Value{.Table = Table.init(self.allocator)});
-            subdata = &gpr.kv.value.Array.items[gpr.kv.value.Array.items.len-1].Table;
-        }
-        return parseBracketResult{
-            .data = subdata.?,
-            .offset = offset,
-        };
+        return self.lookupAndParseKVs(input, offset, keys.keys.items, count > 1, T, data);
     }
 
-    pub fn parse(self: *Parser, input: []const u8) !Value {
-        var top = Table.init(self.allocator);
-        errdefer (Value{.Table = top}).deinit();
-        var offset: usize = 0;
-        var data = &top;
+    fn createT(self: *Parser, comptime T: type) !T {
+        if (T == Value) {
+            return Value{.Table = Table.init(self.allocator)};
+        } else if (@hasDecl(T, "init")) {
+            var ft = @typeInfo(@TypeOf(T.init)).Fn;
+            if (ft.return_type == T and ft.args.len == 1 and ft.args[0].arg_type.? == std.mem.allocator) {
+                return T.init(self.allocator);
+            }
+        } else {
+            if (@typeInfo(T).Pointer) |ptr| {
+                return self.allocator.create(ptr.child);
+            }
+        }
+        return ParseError.UnknownReturnType;
+    }
+
+    fn destroyT(self: *Parser, comptime T: type, v: T) void {
+        if (T == Value) {
+            return v.deinit();
+        } else if (@hasDecl(T, "deinit")) {
+            if (@typeInfo(@TypeOf(v.deinit)).Fn) |f| {
+                if (f.args.len == 0) {
+                    v.deinit();
+                }
+            }
+        } else {
+            if (@typeInfo(T).Pointer) |ptr| {
+                self.allocator.destroy(v);
+            }
+        }
+    }
+
+    pub fn parseKVs(self: *Parser, input: []const u8, offset_in: usize, comptime T: type, value: *T) !usize {
+        if (T == Value and value.* != .Table) {
+            return ParseError.IncorrectDataType;
+        }
+        var offset: usize = offset_in;
         while (offset < input.len) {
-            offset = self.skipSpacesAndReturns(input, offset);
-            offset = self.skipComment(input, offset);
+            offset = self.skipSpacesAndComments(input, offset);
+            if (offset >= input.len or input[offset] == '[') {
+                return offset;
+            }
+            offset = try self.parseAssign(input, offset, T, value);
+        }
+        return offset;
+    }
+
+    pub fn parse(self: *Parser, comptime T: type, input: []const u8) !T {
+        var top = try self.createT(T);
+        errdefer self.destroyT(T, top);
+        var offset = try self.parseKVs(input, 0, T, &top);
+        while (offset < input.len) {
+            offset = self.skipSpacesAndComments(input, offset);
             if (offset >= input.len) {
                 break;
             }
-            offset = self.skipSpacesAndReturns(input, offset);
-            if (self.parseBracket(input, offset, &top)) |result| {
-                data = result.data;
-                offset = result.offset;
-            } else |_| {
-                offset = try self.parseAssign(input, offset, data);
-            }
-            offset = self.skipSpaces(input, offset);
-            offset = self.skipComment(input, offset);
-            offset = self.skipSpacesAndReturns(input, offset);
+            offset = try self.parseBracket(input, offset, T, &top);
         }
-        return Value{.Table = top};
+        return top;
     }
 };
 
@@ -629,7 +764,7 @@ test "empty" {
     var allocator = &tester.allocator;
     var parser = try Parser.init(allocator);
     defer allocator.destroy(parser);
-    var parsed = try parser.parse("");
+    var parsed = try parser.parse(Value, "");
     expect(parsed.Table.size == 0);
 }
 
@@ -639,7 +774,7 @@ test "simple-kv" {
     var allocator = &tester.allocator;
     var parser = try Parser.init(allocator);
     defer allocator.destroy(parser);
-    var parsed = try parser.parse(" \t foo\t=  42 # comment1  \nbar= \t42.");
+    var parsed = try parser.parse(Value, " \t foo\t=  42 # comment1  \nbar= \t42.");
     defer parsed.deinit();
     expect(parsed.Table.size == 2);
     expect(getS(parsed.Table, "foo").?.value.Int == 42);
@@ -652,7 +787,7 @@ test "string-kv" {
     var allocator = &tester.allocator;
     var parser = try Parser.init(allocator);
     defer allocator.destroy(parser);
-    var parsed = try parser.parse("#test\n \t foo\t=  \"bar\"   \n");
+    var parsed = try parser.parse(Value, "#test\n \t foo\t=  \"bar\"   \n");
     defer parsed.deinit();
     expect(parsed.Table.size == 1);
     expect(checkS(parsed.Table, "foo", "bar"));
@@ -664,7 +799,7 @@ test "bracket-kv" {
     var allocator = &tester.allocator;
     var parser = try Parser.init(allocator);
     defer allocator.destroy(parser);
-    var parsed = try parser.parse("[foo]\nbar=42\nbaz=true\n[quox]\nbar=96\n");
+    var parsed = try parser.parse(Value, "[foo]\nbar=42\nbaz=true\n[quox]\nbar=96\n");
     defer parsed.deinit();
     expect(parsed.Table.size == 2);
     var o1 = getS(parsed.Table, "foo").?.value.Table;
@@ -682,7 +817,7 @@ test "double-bracket" {
     var allocator = &tester.allocator;
     var parser = try Parser.init(allocator);
     defer allocator.destroy(parser);
-    var parsed = try parser.parse("[[foo]]\nbar=42\nbaz=true\n[[foo]]\nbar=96\n");
+    var parsed = try parser.parse(Value, "[[foo]]\nbar=42\nbaz=true\n[[foo]]\nbar=96\n");
     defer parsed.deinit();
     expect(parsed.Table.size == 1);
     var a = getS(parsed.Table, "foo").?.value.Array;
@@ -702,7 +837,7 @@ test "double-bracket-subtable" {
     var allocator = &tester.allocator;
     var parser = try Parser.init(allocator);
     defer allocator.destroy(parser);
-    var parsed = try parser.parse(
+    var parsed = try parser.parse(Value,
         \\[[fruit]]
         \\  name = "apple"
         \\  [fruit.physical] # subtable
@@ -750,21 +885,21 @@ test "parseBool" {
     var parser = try Parser.init(allocator);
     defer allocator.destroy(parser);
 
-    var n: Value = .{.Int = 0};
-    expect((try parser.parseBool("true", 0, &n)) == 4);
-    expect(n.Bool);
-    expect((try parser.parseBool("true   ", 0, &n)) == 4);
-    expect(n.Bool);
-    expect(parser.parseBool("trues", 0, &n) catch |err| e: {
+    var b = false;
+    expect((try parser.parseBool("true", 0, &b)) == 4);
+    expect(b);
+    expect((try parser.parseBool("true   ", 0, &b)) == 4);
+    expect(b);
+    expect(parser.parseBool("trues", 0, &b) catch |err| e: {
         expect(err == ParseError.FailedToParse);
         break :e 0;
     } == 0);
 
-    expect((try parser.parseBool("false", 0, &n)) == 5);
-    expect(!n.Bool);
-    expect((try parser.parseBool("false   ", 0, &n)) == 5);
-    expect(!n.Bool);
-    expect(parser.parseBool("falses", 0, &n) catch |err| e: {
+    expect((try parser.parseBool("false", 0, &b)) == 5);
+    expect(!b);
+    expect((try parser.parseBool("false   ", 0, &b)) == 5);
+    expect(!b);
+    expect(parser.parseBool("falses", 0, &b) catch |err| e: {
         expect(err == ParseError.FailedToParse);
         break :e 0;
     } == 0);
@@ -777,31 +912,31 @@ test "parseInt" {
     var parser = try Parser.init(allocator);
     defer allocator.destroy(parser);
 
-    var n: Value = .{.Bool = false};
+    var n: i64 = 0;
     expect((try parser.parseInt("123", 0, &n)) == 3);
-    expect(n.Int == 123);
+    expect(n == 123);
 
     expect((try parser.parseInt("-123", 0, &n)) == 4);
-    expect(n.Int == -123);
+    expect(n == -123);
 
     expect((try parser.parseInt("+123_456_789", 0, &n)) == 12);
-    expect(n.Int == 123456789);
+    expect(n == 123456789);
 
     expect((try parser.parseInt("0XFF", 0, &n)) == 4);
-    expect(n.Int == 255);
+    expect(n == 255);
 
     expect((try parser.parseInt("0Xa", 0, &n)) == 3);
-    expect(n.Int == 10);
+    expect(n == 10);
 
     expect((try parser.parseInt("0o20", 0, &n)) == 4);
-    expect(n.Int == 16);
+    expect(n == 16);
 
     expect((try parser.parseInt("0b0100", 0, &n)) == 6);
-    expect(n.Int == 4);
+    expect(n == 4);
 
     // hexadecimal with underscore.
     expect((try parser.parseInt("0xa_1", 0, &n)) == 5);
-    expect(n.Int == 161);
+    expect(n == 161);
 
     // invalid octal.
     expect(parser.parseInt("0o9", 0, &n) catch |err| e: {
@@ -841,15 +976,15 @@ test "parseFloat" {
     var parser = try Parser.init(allocator);
     defer allocator.destroy(parser);
 
-    var n: Value = .{.Bool = false};
-    expect((try parser.parseFloat("1.5", 0, &n)) == 3);
-    expect(n.Float == 1.5);
-    expect((try parser.parseFloat("-1e2", 0, &n)) == 4);
-    expect(n.Float == -1e2);
-    expect((try parser.parseFloat(".2e-1", 0, &n)) == 5);
-    expect(n.Float == 0.2e-1);
-    expect((try parser.parseFloat("1.e+2", 0, &n)) == 5);
-    expect(n.Float == 1e+2);
+    var f: f64 = 0.0;
+    expect((try parser.parseFloat("1.5", 0, &f)) == 3);
+    expect(f == 1.5);
+    expect((try parser.parseFloat("-1e2", 0, &f)) == 4);
+    expect(f == -1e2);
+    expect((try parser.parseFloat(".2e-1", 0, &f)) == 5);
+    expect(f == 0.2e-1);
+    expect((try parser.parseFloat("1.e+2", 0, &f)) == 5);
+    expect(f == 1e+2);
 }
 
 test "parseString" {
@@ -957,27 +1092,27 @@ test "parseKey-quoted" {
     expect(mem.eql(u8, keys.keys.items[1].items, "google.com"));
 }
 
-test "parseBracket" {
-    var tester = testing.LeakCountAllocator.init(std.heap.page_allocator);
-    defer tester.validate() catch {};
-    var allocator = &tester.allocator;
-    var parser = try Parser.init(allocator);
-    defer allocator.destroy(parser);
+// test "parseBracket" {
+//     var tester = testing.LeakCountAllocator.init(std.heap.page_allocator);
+//     defer tester.validate() catch {};
+//     var allocator = &tester.allocator;
+//     var parser = try Parser.init(allocator);
+//     defer allocator.destroy(parser);
 
-    var data = Table.init(allocator);
-    defer data.deinit();
-    defer {
-        var i = data.iterator();
-        while (i.next()) |kv| {
-            kv.key.deinit();
-            kv.value.deinit();
-        }
-    }
-    var result = try parser.parseBracket("[foo]", 0, &data);
-    expect(result.offset == 5);
-    expect(data.size == 1);
-    expect(&getS(data, "foo").?.value.Table == result.data);
-}
+//     var data = Table.init(allocator);
+//     defer data.deinit();
+//     defer {
+//         var i = data.iterator();
+//         while (i.next()) |kv| {
+//             kv.key.deinit();
+//             kv.value.deinit();
+//         }
+//     }
+//     var result = try parser.parseBracket("[foo]", 0, &data);
+//     expect(result.offset == 5);
+//     expect(data.size == 1);
+//     expect(&getS(data, "foo").?.value.Table == result.data);
+// }
 
 test "parseArray" {
     var tester = testing.LeakCountAllocator.init(std.heap.page_allocator);
@@ -986,12 +1121,12 @@ test "parseArray" {
     var parser = try Parser.init(allocator);
     defer allocator.destroy(parser);
 
-    var n: Value = .{.Bool = false};
-    defer n.deinit();
-    expect((try parser.parseArray("[ 42, 43.0,\n true, false ]", 0, &n)) == 26);
-    expect(n.Array.items.len == 4);
-    expect(n.Array.items[0].Int == 42);
-    expect(n.Array.items[1].Float == 43.0);
-    expect(n.Array.items[2].Bool);
-    expect(!n.Array.items[3].Bool);
+    var a = std.ArrayList(Value).init(allocator);
+    defer a.deinit();
+    expect((try parser.parseArray("[ 42, 43.0,\n true, false ]", 0, Value, &a)) == 26);
+    expect(a.items.len == 4);
+    expect(a.items[0].Int == 42);
+    expect(a.items[1].Float == 43.0);
+    expect(a.items[2].Bool);
+    expect(!a.items[3].Bool);
 }
