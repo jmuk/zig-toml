@@ -522,19 +522,45 @@ pub const Parser = struct {
             .Bool => return self.parseBool(input, offset, v),
             .Int => return self.parseInt(input, offset, v),
             .Float => return self.parseFloat(input, offset, v),
-            .Array => |arr| {
-                if (arr.child_type == u8) {
-                    var s = Key.init(self.allocator);
-                    errdefer s.deinit();
-                    offset = try self.parseString(input, offset, &s);
-                    v.* = s.items;
-                    return offset;
+            .Pointer => |ptr| {
+                if (ptr.size == .One) {
+                    v.* = try self.allocator.create(ptr.child);
+                    errdefer self.allocator.destroy(v.*);
+                    return self.parseValue(input, offset, ptr.child, v.*);
                 }
+                var allocator = if (ptr.size == .C)
+                    std.heap.c_allocator
+                else
+                    self.allocator
+                ;
+                var a = std.ArrayList(ptr.child).init(allocator);
+                errdefer a.deinit();
+                offset = try if (ptr.child == u8)
+                    self.parseString(input, offset, &a)
+                else
+                    self.parseArray(input, offset, ptr.child, &a)
+                ;
+                v.* = a.items;
+                return offset;
+            },
+            .Array => |arr| {
+                var a = sstd.ArrayList(arr.child).init(self.allocator);
+                defer a.deinit();
+                if (arr.child_type == u8) {
+                    offset = try self.parseString(input, offset, &a);
+                } else {
+                    offset = try self.parseArray(input, offset, ptr.child, &a);
+                }
+                for (a.items) |item, i| {
+                    if (i < arr.len) {
+                        v.*[i] = item;
+                    }
+                }
+                return offset;
             },
             else => return ParseError.IncorrectDataType,
             // TODO: struct
         }
-
     }
 
     fn lookupAndParseValue(self: *Parser, input: []const u8, offset_in: usize, keys: []Key, comptime T: type, v: *T) anyerror!usize {
@@ -554,19 +580,12 @@ pub const Parser = struct {
                 }
                 return self.parseValue(input, offset_in, Value, &gpr.kv.value);
             } else {
-                var ti = @typeInfo(T);
+                defer key.deinit();
+                comptime var ti = @typeInfo(T);
                 if (ti != .Struct)
                     return ParseError.IncorrectDataType;
-                inline for (structInfo.fields) |field| {
+                inline for (ti.Struct.fields) |field| {
                     if (mem.eql(u8, key.items, field.name)) {
-                        var fti = @typeInfo(field.field_type);
-                        if (fti == .Pointer) {
-                            var f = self.allocator.create(fti.child_type);
-                            errdefer self.allocator.destroy(f);
-                            var offset = try self.parseValue(input, offset_in, fti.child_type, f);
-                            @field(v, field.name) = v;
-                            return offset;
-                        }
                         return self.parseValue(input, offset_in, field.field_type, &(@field(v, field.name)));
                     }
                 }
@@ -585,23 +604,24 @@ pub const Parser = struct {
             }
             return ParseError.IncorrectDataType;
         }
-        var ti = @typeInfo(T);
-        if (ti = .Struct)
+        defer key.deinit();
+        comptime var ti = @typeInfo(T);
+        if (ti != .Struct)
             return ParseError.IncorrectDataType;
-        inline for (structInfo.fields) |field| {
+        inline for (ti.Struct.fields) |field| {
             if (mem.eql(u8, key.items, field.name)) {
-                var fti = @typeInfo(field.field_type);
-                if (fti == .Pointer) {
-                    var f = self.allocator.create(fti.child_type);
+                comptime var fti = @typeInfo(field.field_type);
+                if (fti == .Pointer and fti.Pointer.size == .One) {
+                    var f = try self.allocator.create(fti.Pointer.child);
                     errdefer self.allocator.destroy(f);
-                    var offset = try self.lookupAndParseValue(input, offset_in, keys[1..(keys.len)], fti.child_type, f);
+                    var offset = try self.lookupAndParseValue(input, offset_in, keys[1..(keys.len)], fti.Pointer.child, f);
                     @field(v, field.name) = f;
                     return offset;
                 }
                 return self.lookupAndParseValue(input, offset_in, keys[1..(keys.len)], field.field_type, &(@field(v, field.name)));
             }
         }
-        return ParseError.FIeldNotFound;
+        return ParseError.FieldNotFound;
     }
 
     fn parseAssign(self: *Parser, input: []const u8, offset_in: usize, comptime T: type, data: *T) !usize {
@@ -657,9 +677,40 @@ pub const Parser = struct {
                 gpr.kv.value = Value{.Table = Table.init(self.allocator)};
                 errdefer gpr.kv.value.deinit();
                 return self.parseKVs(input, offset_in, Value, &gpr.kv.value);
-            } else {
-                return ParseError.IncorrectDataType;
             }
+            defer key.deinit();
+            if (@typeInfo(T) != .Struct)
+                return ParseError.IncorrectDataType;
+            inline for (@typeInfo(T).Struct.fields) |field| {
+                if (mem.eql(u8, key.items, field.name)) {
+                    switch (@typeInfo(field.field_type)) {
+                        .Pointer => |ptr| {
+                            if (ptr.size == .One) {
+                                if (is_array)
+                                    return ParseError.IncorrectDataType;
+                                @field(data, field.name) = try self.createT(field.field_type);
+                                errdefer self.destroyT(field.field_type, @field(data, field.name));
+                                return self.parseKVs(input, offset_in, ptr.child, @field(data, field.name));
+                            }
+                            if (!is_array)
+                                return ParseError.IncorrectDataType;
+                            var l = @field(data, field.name).len;
+                            if (l == 0) {
+                                @field(data, field.name) = try self.allocator.alloc(ptr.child, 1);
+                            } else {
+                                @field(data, field.name) = try self.allocator.realloc(@field(data, field.name), l+1);
+                            }
+                            @field(data, field.name)[l] = try self.createT(ptr.child);
+                            return self.parseKVs(input, offset_in, ptr.child, &(@field(data, field.name)[l]));
+                        },
+                        .Struct => |str| {
+                            return self.parseKVs(input, offset_in, field.field_type, &(@field(data, field.name)));
+                        },
+                        else => {},
+                    }
+                }
+            }
+            return ParseError.IncorrectDataType;
         }
 
         if (T == Value) {
@@ -679,9 +730,31 @@ pub const Parser = struct {
             gpr.kv.value = Value{.Table = Table.init(self.allocator)};
             errdefer gpr.kv.value.deinit();
             return self.lookupAndParseKVs(input, offset_in, keys[1..(keys.len)], is_array, T, &gpr.kv.value);
-        } else {
-            return ParseError.IncorrectDataType;
         }
+        defer key.deinit();
+        if (@typeInfo(T) != .Struct)
+            return ParseError.IncorrectDataType;
+        inline for (@typeInfo(T).Struct.fields) |field| {
+            if (mem.eql(u8, key.items, field.name)) {
+                switch (@typeInfo(field.field_type)) {
+                    .Pointer => |ptr| {
+                        if (ptr.size == .One) {
+                            @field(data, field.name) = try self.createT(field.field_type);
+                            errdefer self.destroyT(field.field_type, @field(data, field.name));
+                            return self.lookupAndParseKVs(input, offset_in, keys[1..(keys.len)], is_array, ptr.child, @field(data, field.name));
+                        }
+                        if (@field(data, field.name).len == 0)
+                            return ParseError.FailedToParse;
+                        return self.lookupAndParseKVs(input, offset_in, keys[1..(keys.len)], is_array, ptr.child, &(@field(data, field.name)[@field(data, field.name).len-1]));
+                    },
+                    .Struct => |str| {
+                        return self.lookupAndParseKVs(input, offset_in, keys[1..(keys.len)], is_array, field.field_type, &(@field(data, field.name)));
+                    },
+                    else => {},
+                }
+            }
+        }
+        return ParseError.IncorrectDataType;
     }
 
     fn parseBracket(self: *Parser, input: []const u8, offset_in: usize, comptime T: type, data: *T) !usize {
@@ -709,14 +782,15 @@ pub const Parser = struct {
     fn createT(self: *Parser, comptime T: type) !T {
         if (T == Value) {
             return Value{.Table = Table.init(self.allocator)};
-        } else if (@hasDecl(T, "init")) {
-            var ft = @typeInfo(@TypeOf(T.init)).Fn;
-            if (ft.return_type == T and ft.args.len == 1 and ft.args[0].arg_type.? == std.mem.allocator) {
+        } else if (@typeInfo(T) == .Struct and @hasDecl(T, "init")) {
+            comptime var ft = @typeInfo(@TypeOf(T.init)).Fn;
+            if (ft.return_type == T and ft.args.len == 1 and ft.args[0].arg_type.? == *std.mem.Allocator) {
                 return T.init(self.allocator);
             }
         } else {
-            if (@typeInfo(T).Pointer) |ptr| {
-                return self.allocator.create(ptr.child);
+            switch (@typeInfo(T)) {
+                .Pointer => |ptr| return self.allocator.create(ptr.child),
+                else => return undefined,
             }
         }
         return ParseError.UnknownReturnType;
@@ -725,15 +799,17 @@ pub const Parser = struct {
     fn destroyT(self: *Parser, comptime T: type, v: T) void {
         if (T == Value) {
             return v.deinit();
-        } else if (@hasDecl(T, "deinit")) {
-            if (@typeInfo(@TypeOf(v.deinit)).Fn) |f| {
-                if (f.args.len == 0) {
+        } else if (@typeInfo(T) == .Struct and @hasDecl(T, "deinit")) {
+            switch (@typeInfo(@TypeOf(v.deinit))) {
+                .BoundFn => |f| if (f.args.len == 0) {
                     v.deinit();
-                }
+                },
+                else => {},
             }
         } else {
-            if (@typeInfo(T).Pointer) |ptr| {
-                self.allocator.destroy(v);
+            switch (@typeInfo(T)) {
+                .Pointer => |ptr| self.allocator.destroy(v),
+                else => {},
             }
         }
     }
@@ -756,13 +832,19 @@ pub const Parser = struct {
     pub fn parse(self: *Parser, comptime T: type, input: []const u8) !T {
         var top = try self.createT(T);
         errdefer self.destroyT(T, top);
-        var offset = try self.parseKVs(input, 0, T, &top);
+        var offset = try switch (@typeInfo(T)) {
+            .Pointer => |ptr| self.parseKVs(input, 0, ptr.child, top),
+            else => self.parseKVs(input, 0, T, &top),
+        };
         while (offset < input.len) {
             offset = self.skipSpacesAndComments(input, offset);
             if (offset >= input.len) {
                 break;
             }
-            offset = try self.parseBracket(input, offset, T, &top);
+            offset = try switch(@typeInfo(T)) {
+                .Pointer => |ptr| self.parseBracket(input, offset, ptr.child, top),
+                else => self.parseBracket(input, offset, T, &top),
+            };
         }
         return top;
     }
@@ -805,7 +887,7 @@ test "simple-kv" {
     expect(getS(parsed.Table, "bar").?.value.Float == 42);
 }
 
-test "simple-kv-struct" {
+test "simple-struct" {
     const st = struct {
         foo: i64,
         bar: f64,
@@ -816,8 +898,8 @@ test "simple-kv-struct" {
     var parser = try Parser.init(allocator);
     defer allocator.destroy(parser);
     var parsed = try parser.parse(st, " \t foo\t=  42 # comment1  \nbar= \t42.");
-    expect(st.foo == 42);
-    expect(st.bar == 42.0);
+    expect(parsed.foo == 42);
+    expect(parsed.bar == 42.0);
 }
 
 test "string-kv" {
@@ -830,6 +912,21 @@ test "string-kv" {
     defer parsed.deinit();
     expect(parsed.Table.size == 1);
     expect(checkS(parsed.Table, "foo", "bar"));
+}
+
+test "string-struct" {
+    const st = struct {
+        foo: []u8,
+    };
+
+    var tester = testing.LeakCountAllocator.init(std.heap.page_allocator);
+    defer tester.validate() catch {};
+    var allocator = &tester.allocator;
+    var parser = try Parser.init(allocator);
+    defer allocator.destroy(parser);
+    var parsed = try parser.parse(st, "#test\n \t foo\t=  \"bar\"   \n");
+    defer allocator.free(parsed.foo);
+    expect(mem.eql(u8, parsed.foo, "bar"));
 }
 
 test "bracket-kv" {
@@ -848,6 +945,30 @@ test "bracket-kv" {
     var o2 = getS(parsed.Table, "quox").?.value.Table;
     expect(o2.size == 1);
     expect(getS(o2, "bar").?.value.Int == 96);
+}
+
+test "bracket-struct" {
+    const foo = struct {
+        bar: i64,
+        baz: bool,
+    };
+    const quox = struct {
+        bar: i64,
+    };
+    const st = struct {
+        foo: *foo,
+        quox: quox,
+    };
+    var tester = testing.LeakCountAllocator.init(std.heap.page_allocator);
+    defer tester.validate() catch {};
+    var allocator = &tester.allocator;
+    var parser = try Parser.init(allocator);
+    defer allocator.destroy(parser);
+    var parsed = try parser.parse(st, "[foo]\nbar=42\nbaz=true\n[quox]\nbar=96\n");
+    defer allocator.destroy(parsed.foo);
+    expect(parsed.foo.bar == 42);
+    expect(parsed.foo.baz);
+    expect(parsed.quox.bar == 96);
 }
 
 test "double-bracket" {
@@ -870,13 +991,7 @@ test "double-bracket" {
     expect(getS(o2, "bar").?.value.Int == 96);
 }
 
-test "double-bracket-subtable" {
-    var tester = testing.LeakCountAllocator.init(std.heap.page_allocator);
-    defer tester.validate() catch {};
-    var allocator = &tester.allocator;
-    var parser = try Parser.init(allocator);
-    defer allocator.destroy(parser);
-    var parsed = try parser.parse(Value,
+const subtable_text =
         \\[[fruit]]
         \\  name = "apple"
         \\  [fruit.physical] # subtable
@@ -892,7 +1007,15 @@ test "double-bracket-subtable" {
         \\  name = "banana"
         \\  [[fruit.variety]]
         \\    name = "plantain"
-    );
+;
+
+test "double-bracket-subtable" {
+    var tester = testing.LeakCountAllocator.init(std.heap.page_allocator);
+    defer tester.validate() catch {};
+    var allocator = &tester.allocator;
+    var parser = try Parser.init(allocator);
+    defer allocator.destroy(parser);
+    var parsed = try parser.parse(Value, subtable_text);
     defer parsed.deinit();
 
     expect(parsed.Table.size == 1);
@@ -915,6 +1038,83 @@ test "double-bracket-subtable" {
     varieties = getS(banana, "variety").?.value.Array;
     expect(varieties.items.len == 1);
     expect(checkS(varieties.items[0].Table, "name", "plantain"));
+}
+
+const fruit_physical = struct {
+    color: []u8,
+    shape: []u8,
+};
+
+const fruit_variety = struct {
+    name: []u8,
+};
+
+const fruit = struct {
+    name: []u8,
+    physical: fruit_physical,
+    variety: []fruit_variety,
+    allocator: *mem.Allocator,
+
+    fn init(allocator: *mem.Allocator) fruit {
+        return .{
+            .name = "",
+            .physical = .{.color = "", .shape = ""},
+            .variety = &[0]fruit_variety{},
+            .allocator = allocator};
+    }
+
+    fn deinit(self: fruit) void {
+        self.allocator.free(self.name);
+        self.allocator.free(self.physical.color);
+        self.allocator.free(self.physical.shape);
+        for (self.variety) |v| {
+            self.allocator.free(v.name);
+        }
+        self.allocator.free(self.variety);
+    }
+};
+
+const tfruits = struct {
+    fruit: []fruit,
+    allocator: *mem.Allocator,
+
+    fn init(allocator: *mem.Allocator) tfruits {
+        return .{.fruit = &[0]fruit{}, .allocator = allocator};
+    }
+
+    fn deinit(self: tfruits) void {
+        for (self.fruit) |f| {
+            f.deinit();
+        }
+        self.allocator.free(self.fruit);
+    }
+};
+
+test "double-bracket-subtable-struct" {
+    var tester = testing.LeakCountAllocator.init(std.heap.page_allocator);
+    defer tester.validate() catch {};
+    var allocator = &tester.allocator;
+    var parser = try Parser.init(allocator);
+    defer allocator.destroy(parser);
+    var parsed = try parser.parse(tfruits, subtable_text);
+    defer allocator.free(parsed.fruit);
+    defer for (parsed.fruit) |f| {
+        f.deinit();
+    };
+
+    expect(parsed.fruit.len == 2);
+    var apple = parsed.fruit[0];
+    expect(mem.eql(u8, apple.name, "apple"));
+    expect(mem.eql(u8, apple.physical.color, "red"));
+    expect(mem.eql(u8, apple.physical.shape, "round"));
+    expect(apple.variety.len == 2);
+    expect(mem.eql(u8, apple.variety[0].name, "red delicious"));
+    expect(mem.eql(u8, apple.variety[1].name, "granny smith"));
+
+    var banana = parsed.fruit[1];
+    expect(mem.eql(u8, banana.name, "banana"));
+    expect(banana.variety.len == 1);
+    expect(mem.eql(u8, banana.variety[0].name, "plantain"));
 }
 
 test "parseBool" {
@@ -1130,28 +1330,6 @@ test "parseKey-quoted" {
     expect(mem.eql(u8, keys.keys.items[0].items, "site"));
     expect(mem.eql(u8, keys.keys.items[1].items, "google.com"));
 }
-
-// test "parseBracket" {
-//     var tester = testing.LeakCountAllocator.init(std.heap.page_allocator);
-//     defer tester.validate() catch {};
-//     var allocator = &tester.allocator;
-//     var parser = try Parser.init(allocator);
-//     defer allocator.destroy(parser);
-
-//     var data = Table.init(allocator);
-//     defer data.deinit();
-//     defer {
-//         var i = data.iterator();
-//         while (i.next()) |kv| {
-//             kv.key.deinit();
-//             kv.value.deinit();
-//         }
-//     }
-//     var result = try parser.parseBracket("[foo]", 0, &data);
-//     expect(result.offset == 5);
-//     expect(data.size == 1);
-//     expect(&getS(data, "foo").?.value.Table == result.data);
-// }
 
 test "parseArray" {
     var tester = testing.LeakCountAllocator.init(std.heap.page_allocator);
