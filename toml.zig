@@ -1315,6 +1315,75 @@ test "double-bracket-subtable-struct" {
     expect(mem.eql(u8, banana.variety[0].name, "plantain"));
 }
 
+const example_data =
+    \\# This is a TOML document
+    \\
+    \\title = "TOML Example"
+    \\
+    \\[owner]
+    \\name = "Tom Preston-Werner"
+    \\#datetime is not supported yet
+    \\#dob = 1979-05-27T07:32:00-08:00
+    \\
+    \\[database]
+    \\enabled = true
+    \\ports = [ 8001, 8001, 8002 ]
+    \\data = [ ["delta", "phi"], [3.14] ]
+    \\temp_targets = { cpu = 79.5, case = 72.0 }
+    \\
+    \\[servers]
+    \\
+    \\[servers.alpha]
+    \\ip = "10.0.0.1"
+    \\role = "frontend"
+    \\
+    \\[servers.beta]
+    \\ip = "10.0.0.2"
+    \\role = "backend"
+;
+
+test "example" {
+    var tester = testing.LeakCountAllocator.init(std.heap.page_allocator);
+    defer tester.validate() catch {};
+    var allocator = &tester.allocator;
+    var parser = try Parser.init(allocator);
+    defer allocator.destroy(parser);
+    var parsed = try parser.parse(Value, example_data);
+    defer parsed.deinit();
+
+    expect(parsed.Table.size == 4);
+    expect(checkS(parsed.Table, "title", "TOML Example"));
+    var owner = getS(parsed.Table, "owner").?.value.Table;
+    expect(owner.size == 1);
+    expect(checkS(owner, "name", "Tom Preston-Werner"));
+
+    var database = getS(parsed.Table, "database").?.value.Table;
+    expect(getS(database, "enabled").?.value.Bool);
+    var ports = getS(database, "ports").?.value.Array;
+    expect(ports.items.len == 3);
+    expect(ports.items[0].Int == 8001);
+    expect(ports.items[1].Int == 8001);
+    expect(ports.items[2].Int == 8002);
+    var data = getS(database, "data").?.value.Array;
+    expect(data.items.len == 2);
+    expect(mem.eql(u8, data.items[0].Array.items[0].String.items, "delta"));
+    expect(mem.eql(u8, data.items[0].Array.items[1].String.items, "phi"));
+    expect(data.items[1].Array.items[0].Float == 3.14);
+    var temp_targets = getS(database, "temp_targets").?.value.Table;
+    expect(temp_targets.size == 2);
+    expect(getS(temp_targets, "cpu").?.value.Float == 79.5);
+    expect(getS(temp_targets, "case").?.value.Float == 72.0);
+
+    var servers = getS(parsed.Table, "servers").?.value.Table;
+    expect(servers.size == 2);
+    var alpha = getS(servers, "alpha").?.value.Table;
+    expect(checkS(alpha, "ip", "10.0.0.1"));
+    expect(checkS(alpha, "role", "frontend"));
+    var beta = getS(servers, "beta").?.value.Table;
+    expect(checkS(beta, "ip", "10.0.0.2"));
+    expect(checkS(beta, "role", "backend"));
+}
+
 test "parseBool" {
     var tester = testing.LeakCountAllocator.init(std.heap.page_allocator);
     defer tester.validate() catch {};
