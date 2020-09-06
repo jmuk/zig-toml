@@ -71,6 +71,76 @@ pub const ParseError = error {
     FieldNotFound,
 };
 
+const VisitType = enum {
+    None,
+    Keyvalue,
+    Bracket,
+};
+
+const VisitedNode = struct {
+    visit_type: VisitType,
+    children: std.HashMap(Key, VisitedNode, hashKey, eqlKey),
+    allocator: *mem.Allocator,
+
+    fn init(allocator: *mem.Allocator) VisitedNode {
+        return .{
+            .visit_type = .None,
+            .children = std.HashMap(Key, VisitedNode, hashKey, eqlKey).init(allocator),
+            .allocator = allocator,
+        };
+    }
+
+    fn deinit(self: VisitedNode) void {
+        var i = self.children.iterator();
+        while (i.next()) |kv| {
+            kv.key.deinit();
+            kv.value.deinit();
+        }
+        self.children.deinit();
+    }
+
+    fn visitedType(self: *VisitedNode, key: Key) VisitType {
+        if (self.children.get(key)) |kv| {
+            return kv.value.visit_type;
+        }
+        return .None;
+    }
+
+    fn markVisited(self: *VisitedNode, key: Key, visit_type: VisitType) !void {
+        var node = VisitedNode.init(self.allocator);
+        node.visit_type = visit_type;
+        var copiedKey = Key.init(self.allocator);
+        errdefer copiedKey.deinit();
+        _ = try copiedKey.appendSlice(key.items);
+        var out = try self.children.put(copiedKey, node);
+    }
+
+    fn idxToKey(self: *VisitedNode, idx: usize) !Key {
+        var key = Key.init(self.allocator);
+        try std.fmt.formatInt(idx, 16, false, std.fmt.FormatOptions{}, key.outStream());
+        return key;
+    }
+
+    fn markVisitedIdx(self: *VisitedNode, idx: usize, visit_type: VisitType) !void {
+        var key = try self.idxToKey(idx);
+        defer key.deinit();
+        return self.markVisited(key, visit_type);
+    }
+
+    fn getChild(self: *VisitedNode, key: Key) ?*VisitedNode {
+        if (self.children.get(key)) |kv| {
+            return &kv.value;
+        }
+        return null;
+    }
+
+    fn getChildIdx(self: *VisitedNode, idx: usize) ?*VisitedNode {
+        var key = self.idxToKey(idx) catch return null;
+        defer key.deinit();
+        return self.getChild(key);
+    }
+};
+
 pub const Parser = struct {
     allocator: *std.mem.Allocator,
 
@@ -563,22 +633,23 @@ pub const Parser = struct {
         }
     }
 
-    fn lookupAndParseValue(self: *Parser, input: []const u8, offset_in: usize, keys: []Key, comptime T: type, v: *T) anyerror!usize {
+    fn lookupAndParseValue(self: *Parser, input: []const u8, offset_in: usize, keys: []Key, visited: *VisitedNode, comptime T: type, v: *T) anyerror!usize {
         var key = keys[0];
         errdefer for (keys[1..(keys.len)]) |k| {
             k.deinit();
         };
         if (keys.len == 1) {
+            if (visited.visitedType(key) != .None)
+                return ParseError.DuplicatedKey;
             if (T == Value) {
                 if (v.* != .Table) {
                     return ParseError.IncorrectDataType;
                 }
-                var gpr = try v.*.Table.getOrPut(key);
-                if (gpr.found_existing) {
-                    key.deinit();
-                    return ParseError.DuplicatedKey;
-                }
-                return self.parseValue(input, offset_in, Value, &gpr.kv.value);
+                try visited.markVisited(key, VisitType.Keyvalue);
+                var nv = Value{.Bool = false};
+                var offset = try self.parseValue(input, offset_in, Value, &nv);
+                _ = try v.*.Table.put(key, nv);
+                return offset;
             } else {
                 defer key.deinit();
                 comptime var ti = @typeInfo(T);
@@ -586,6 +657,7 @@ pub const Parser = struct {
                     return ParseError.IncorrectDataType;
                 inline for (ti.Struct.fields) |field| {
                     if (mem.eql(u8, key.items, field.name)) {
+                        try visited.markVisited(key, VisitType.Keyvalue);
                         return self.parseValue(input, offset_in, field.field_type, &(@field(v, field.name)));
                     }
                 }
@@ -599,8 +671,11 @@ pub const Parser = struct {
                     key.deinit();
                 } else {
                     gpr.kv.value = Value{.Table = Table.init(self.allocator)};
+                    try visited.markVisited(key, VisitType.Keyvalue);
                 }
-                return self.lookupAndParseValue(input, offset_in, keys[1..(keys.len)], Value, &gpr.kv.value);
+                return self.lookupAndParseValue(
+                    input, offset_in, keys[1..(keys.len)], visited.getChild(key).?,
+                    Value, &gpr.kv.value);
             }
             return ParseError.IncorrectDataType;
         }
@@ -612,26 +687,37 @@ pub const Parser = struct {
             if (mem.eql(u8, key.items, field.name)) {
                 comptime var fti = @typeInfo(field.field_type);
                 if (fti == .Pointer and fti.Pointer.size == .One) {
+                    if (visited.visitedType(key) != .None) {
+                        return self.lookupAndParseValue(
+                            input, offset_in, keys[1..(keys.len)], visited.getChild(key).?,
+                            fti.Pointer.child, @field(v, field.name));
+                    }
+                    try visited.markVisited(key, VisitType.Keyvalue);
                     var f = try self.allocator.create(fti.Pointer.child);
                     errdefer self.allocator.destroy(f);
-                    var offset = try self.lookupAndParseValue(input, offset_in, keys[1..(keys.len)], fti.Pointer.child, f);
+                    var offset = try self.lookupAndParseValue(
+                        input, offset_in, keys[1..(keys.len)], visited, fti.Pointer.child, f);
                     @field(v, field.name) = f;
                     return offset;
                 }
-                return self.lookupAndParseValue(input, offset_in, keys[1..(keys.len)], field.field_type, &(@field(v, field.name)));
+                if (visited.visitedType(key) == .None)
+                    try visited.markVisited(key, VisitType.Keyvalue);
+                return self.lookupAndParseValue(
+                    input, offset_in, keys[1..(keys.len)], visited.getChild(key).?,
+                    field.field_type, &(@field(v, field.name)));
             }
         }
         return ParseError.FieldNotFound;
     }
 
-    fn parseAssign(self: *Parser, input: []const u8, offset_in: usize, comptime T: type, data: *T) !usize {
+    fn parseAssign(self: *Parser, input: []const u8, offset_in: usize, visited: *VisitedNode, comptime T: type, data: *T) !usize {
         var keys = try self.parseKey(input, offset_in);
         defer keys.keys.deinit();
         if (input[keys.offset] != '=') {
             keys.deinit();
             return ParseError.FailedToParse;
         }
-        return self.lookupAndParseValue(input, keys.offset+1, keys.keys.items, T, data);
+        return self.lookupAndParseValue(input, keys.offset+1, keys.keys.items, visited, T, data);
     }
 
     const parseBracketResult = struct{
@@ -639,35 +725,48 @@ pub const Parser = struct {
         offset: usize
     };
 
-    fn lookupAndParseKVs(self: *Parser, input: []const u8, offset_in: usize, keys: []Key, is_array: bool, comptime T: type, data: *T) !usize {
+    fn lookupAndParseKVs(
+            self: *Parser, input: []const u8, offset_in: usize,
+            keys: []Key, is_array: bool, visited: *VisitedNode, comptime T: type, data: *T) !usize {
         var key = keys[0];
         errdefer for (keys[1..(keys.len)]) |k| {
             k.deinit();
         };
+        var vtype = visited.visitedType(key);
         if (keys.len == 1) {
+            if (vtype == .Keyvalue)
+                return ParseError.DuplicatedKey;
+            if (vtype != .None and !is_array)
+                return ParseError.DuplicatedKey;
             if (T == Value) {
                 if (data.* != .Table) {
                     return ParseError.IncorrectDataType;   
                 }
                 var gpr = try data.Table.getOrPut(key);
                 if (gpr.found_existing) {
-                    key.deinit();
-                    if (gpr.kv.value == .Array) {
-                        if (!is_array) {
-                            return ParseError.IncorrectDataType;
-                        }
-                        var v = Value{.Table = Table.init(self.allocator)};
-                        errdefer v.deinit();
-                        var offset = try self.parseKVs(input, offset_in, Value, &v);
-                        _ = try gpr.kv.value.Array.append(v);
-                        return offset;
-                    }
-                    return ParseError.IncorrectDataType;
+                    defer key.deinit();
+                    if (gpr.kv.value != .Array)
+                        return ParseError.IncorrectDataType;
+                    if (!is_array)
+                        return ParseError.IncorrectDataType;
+                    var v = Value{.Table = Table.init(self.allocator)};
+                    errdefer v.deinit();
+                    var vchild = visited.getChild(key).?;
+                    var idx = gpr.kv.value.Array.items.len;
+                    try vchild.markVisitedIdx(idx, .Bracket);
+                    var offset = try self.parseKVs(
+                        input, offset_in, vchild.getChildIdx(idx).?, Value, &v);
+                    _ = try gpr.kv.value.Array.append(v);
+                    return offset;
                 }
+                try visited.markVisited(key, VisitType.Bracket);
                 if (is_array) {
                     var v = Value{.Table = Table.init(self.allocator)};
                     errdefer v.deinit();
-                    var offset = try self.parseKVs(input, offset_in, Value, &v);
+                    var vchild = visited.getChild(key).?;
+                    try vchild.markVisitedIdx(0, .Bracket);
+                    var offset = try self.parseKVs(
+                        input, offset_in, vchild.getChildIdx(0).?, Value, &v);
                     var a = std.ArrayList(Value).init(self.allocator);
                     errdefer a.deinit();
                     _ = try a.append(v);
@@ -676,7 +775,8 @@ pub const Parser = struct {
                 }
                 gpr.kv.value = Value{.Table = Table.init(self.allocator)};
                 errdefer gpr.kv.value.deinit();
-                return self.parseKVs(input, offset_in, Value, &gpr.kv.value);
+                return self.parseKVs(
+                    input, offset_in, visited.getChild(key).?, Value, &gpr.kv.value);
             }
             defer key.deinit();
             if (@typeInfo(T) != .Struct)
@@ -688,23 +788,36 @@ pub const Parser = struct {
                             if (ptr.size == .One) {
                                 if (is_array)
                                     return ParseError.IncorrectDataType;
+                                if (vtype == .None)
+                                    try visited.markVisited(key, VisitType.Bracket);
                                 @field(data, field.name) = try self.createT(field.field_type);
                                 errdefer self.destroyT(field.field_type, @field(data, field.name));
-                                return self.parseKVs(input, offset_in, ptr.child, @field(data, field.name));
+                                return self.parseKVs(
+                                    input, offset_in, visited.getChild(key).?,
+                                    ptr.child, @field(data, field.name));
                             }
                             if (!is_array)
                                 return ParseError.IncorrectDataType;
-                            var l = @field(data, field.name).len;
+                            var l = if (vtype == VisitType.None) 0 else @field(data, field.name).len;
                             if (l == 0) {
+                                try visited.markVisited(key, VisitType.Bracket);
                                 @field(data, field.name) = try self.allocator.alloc(ptr.child, 1);
                             } else {
                                 @field(data, field.name) = try self.allocator.realloc(@field(data, field.name), l+1);
                             }
                             @field(data, field.name)[l] = try self.createT(ptr.child);
-                            return self.parseKVs(input, offset_in, ptr.child, &(@field(data, field.name)[l]));
+                            var vchild = visited.getChild(key).?;
+                            try vchild.markVisitedIdx(l, .Bracket);
+                            return self.parseKVs(
+                                input, offset_in, vchild.getChildIdx(l).?,
+                                ptr.child, &(@field(data, field.name)[l]));
                         },
                         .Struct => |str| {
-                            return self.parseKVs(input, offset_in, field.field_type, &(@field(data, field.name)));
+                            if (vtype == .None)
+                                try visited.markVisited(key, VisitType.Bracket);
+                            return self.parseKVs(
+                                input, offset_in, visited.getChild(key).?,
+                                field.field_type, &(@field(data, field.name)));
                         },
                         else => {},
                     }
@@ -713,6 +826,9 @@ pub const Parser = struct {
             return ParseError.IncorrectDataType;
         }
 
+        if (vtype == .Keyvalue)
+            return ParseError.DuplicatedKey;
+
         if (T == Value) {
             if (data.* != .Table) {
                 return ParseError.IncorrectDataType;   
@@ -720,16 +836,25 @@ pub const Parser = struct {
             var gpr = try data.Table.getOrPut(key);
 
             if (gpr.found_existing) {
-                key.deinit();
+                defer key.deinit();
                 if (gpr.kv.value == .Array) {
                     var idx = gpr.kv.value.Array.items.len-1;
-                    return self.lookupAndParseKVs(input, offset_in, keys[1..(keys.len)], is_array, T, &gpr.kv.value.Array.items[idx]);
+                    return self.lookupAndParseKVs(
+                        input, offset_in, keys[1..(keys.len)], is_array,
+                        visited.getChild(key).?.getChildIdx(idx).?,
+                        T, &gpr.kv.value.Array.items[idx]);
                 }
-                return self.lookupAndParseKVs(input, offset_in, keys[1..(keys.len)], is_array, T, &gpr.kv.value);
+                return self.lookupAndParseKVs(
+                    input, offset_in, keys[1..(keys.len)], is_array,
+                    visited.getChild(key).?, T, &gpr.kv.value);
             }
+            try visited.markVisited(key, VisitType.Bracket);
             gpr.kv.value = Value{.Table = Table.init(self.allocator)};
             errdefer gpr.kv.value.deinit();
-            return self.lookupAndParseKVs(input, offset_in, keys[1..(keys.len)], is_array, T, &gpr.kv.value);
+            return self.lookupAndParseKVs(
+                input, offset_in, keys[1..(keys.len)], is_array,
+                visited.getChild(key).?,
+                T, &gpr.kv.value);
         }
         defer key.deinit();
         if (@typeInfo(T) != .Struct)
@@ -739,16 +864,34 @@ pub const Parser = struct {
                 switch (@typeInfo(field.field_type)) {
                     .Pointer => |ptr| {
                         if (ptr.size == .One) {
+                            if (vtype == .Bracket) {
+                                return self.lookupAndParseKVs(
+                                    input, offset_in, keys[1..(keys.len)], is_array,
+                                    visited.getChild(key).?,
+                                    ptr.child, @field(data, field.name));
+                            }
+                            try visited.markVisited(key, VisitType.Bracket);
                             @field(data, field.name) = try self.createT(field.field_type);
                             errdefer self.destroyT(field.field_type, @field(data, field.name));
-                            return self.lookupAndParseKVs(input, offset_in, keys[1..(keys.len)], is_array, ptr.child, @field(data, field.name));
+                            return self.lookupAndParseKVs(
+                                input, offset_in, keys[1..(keys.len)], is_array,
+                                visited.getChild(key).?, ptr.child,
+                                @field(data, field.name));
                         }
-                        if (@field(data, field.name).len == 0)
+                        if (vtype == .None)
                             return ParseError.FailedToParse;
-                        return self.lookupAndParseKVs(input, offset_in, keys[1..(keys.len)], is_array, ptr.child, &(@field(data, field.name)[@field(data, field.name).len-1]));
+                        var idx = @field(data, field.name).len - 1;
+                        return self.lookupAndParseKVs(
+                            input, offset_in, keys[1..(keys.len)], is_array,
+                            visited.getChild(key).?.getChildIdx(idx).?,
+                            ptr.child, &(@field(data, field.name)[idx]));
                     },
                     .Struct => |str| {
-                        return self.lookupAndParseKVs(input, offset_in, keys[1..(keys.len)], is_array, field.field_type, &(@field(data, field.name)));
+                        try visited.markVisited(key, VisitType.Bracket);
+                        return self.lookupAndParseKVs(
+                            input, offset_in, keys[1..(keys.len)], is_array,
+                            visited.getChild(key).?,
+                            field.field_type, &(@field(data, field.name)));
                     },
                     else => {},
                 }
@@ -757,7 +900,7 @@ pub const Parser = struct {
         return ParseError.IncorrectDataType;
     }
 
-    fn parseBracket(self: *Parser, input: []const u8, offset_in: usize, comptime T: type, data: *T) !usize {
+    fn parseBracket(self: *Parser, input: []const u8, offset_in: usize, visited: *VisitedNode, comptime T: type, data: *T) !usize {
         var offset = self.skipSpaces(input, offset_in);
         if (input[offset] != '[') {
             return ParseError.FailedToParse;
@@ -776,7 +919,7 @@ pub const Parser = struct {
             }
         }
         offset = keys.offset+count;
-        return self.lookupAndParseKVs(input, offset, keys.keys.items, count > 1, T, data);
+        return self.lookupAndParseKVs(input, offset, keys.keys.items, count > 1, visited, T, data);
     }
 
     fn createT(self: *Parser, comptime T: type) !T {
@@ -814,7 +957,7 @@ pub const Parser = struct {
         }
     }
 
-    pub fn parseKVs(self: *Parser, input: []const u8, offset_in: usize, comptime T: type, value: *T) !usize {
+    pub fn parseKVs(self: *Parser, input: []const u8, offset_in: usize, visited: *VisitedNode, comptime T: type, value: *T) !usize {
         if (T == Value and value.* != .Table) {
             return ParseError.IncorrectDataType;
         }
@@ -824,17 +967,19 @@ pub const Parser = struct {
             if (offset >= input.len or input[offset] == '[') {
                 return offset;
             }
-            offset = try self.parseAssign(input, offset, T, value);
+            offset = try self.parseAssign(input, offset, visited, T, value);
         }
         return offset;
     }
 
     pub fn parse(self: *Parser, comptime T: type, input: []const u8) !T {
+        var visited = VisitedNode.init(self.allocator);
+        defer visited.deinit();
         var top = try self.createT(T);
         errdefer self.destroyT(T, top);
         var offset = try switch (@typeInfo(T)) {
-            .Pointer => |ptr| self.parseKVs(input, 0, ptr.child, top),
-            else => self.parseKVs(input, 0, T, &top),
+            .Pointer => |ptr| self.parseKVs(input, 0, &visited, ptr.child, top),
+            else => self.parseKVs(input, 0, &visited, T, &top),
         };
         while (offset < input.len) {
             offset = self.skipSpacesAndComments(input, offset);
@@ -842,8 +987,8 @@ pub const Parser = struct {
                 break;
             }
             offset = try switch(@typeInfo(T)) {
-                .Pointer => |ptr| self.parseBracket(input, offset, ptr.child, top),
-                else => self.parseBracket(input, offset, T, &top),
+                .Pointer => |ptr| self.parseBracket(input, offset, &visited, ptr.child, top),
+                else => self.parseBracket(input, offset, &visited, T, &top),
             };
         }
         return top;
