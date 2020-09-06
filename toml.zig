@@ -7,12 +7,10 @@ const unicode = std.unicode;
 const testing = std.testing;
 const expect = testing.expect;
 
-pub const ValueTag = enum {
-    String, Int, Float, Bool, Table, Array,
-};
-
+// Key is a key of hash tables to be used in this package.
 pub const Key = std.ArrayList(u8);
 
+// Table is a table from a key to a TOML value.
 pub const Table = std.HashMap(Key, Value, hashKey, eqlKey);
 
 fn eqlKey(a: Key, b: Key) bool {
@@ -23,6 +21,7 @@ fn hashKey(a: Key) u32 {
     return std.hash_map.hashString(a.items);
 }
 
+// getS is a utility to look up in a table with a string literal.
 pub fn getS(tbl: Table, key: []const u8) ?*Table.KV {
     var a = Key.init(tbl.allocator);
     defer a.deinit();
@@ -33,6 +32,12 @@ pub fn getS(tbl: Table, key: []const u8) ?*Table.KV {
     }
 }
 
+pub const ValueTag = enum {
+    String, Int, Float, Bool, Table, Array,
+};
+
+// Value represents a TOML value.
+// TODO: support date/datetime format.
 pub const Value = union(ValueTag) {
     String: std.ArrayList(u8),
     Int: i64,
@@ -63,11 +68,21 @@ pub const Value = union(ValueTag) {
     }
 };
 
+// ParseError is the possible error during parsing.
 pub const ParseError = error {
+    // Generic failure of parsing, incorrect syntax.
     FailedToParse,
+
+    // The key name conflict.
     DuplicatedKey,
+
+    // The receiving data type is not as expected.
     IncorrectDataType,
+
+    // The return type is not supported.
     UnknownReturnType,
+
+    // No related field is found for a key.
     FieldNotFound,
 };
 
@@ -141,6 +156,11 @@ const VisitedNode = struct {
     }
 };
 
+// Parser is a parser of TOML. Use 'parse' method to create the parsed result.
+// It takes an allocator as a parameter, and the parse results and its internal
+// structure will be allocated by this allocator.
+// If the specified type has init() and deinit() functions, it will use these
+// methods for allocating/deallocating the object.
 pub const Parser = struct {
     allocator: *std.mem.Allocator,
 
@@ -153,27 +173,6 @@ pub const Parser = struct {
     fn skipSpaces(self: *Parser, input: []const u8, offset: usize) usize {
         var i = offset;
         while (i < input.len and (input[i] == ' ' or input[i] == '\t')) : (i+=1) {}
-        return i;
-    }
-
-    fn skipSpacesAndReturns(self: *Parser, input: []const u8, offset: usize) usize {
-        var i = offset;
-        while (i < input.len and ascii.isSpace(input[i])) : (i+=1) {}
-        return i;        
-    }
-
-    fn skipComment(self: *Parser, input: []const u8, offset: usize) usize {
-        if (offset >= input.len) {
-            return offset;
-        }
-        if (input[offset] != '#') {
-            return offset;
-        }
-        var i = offset;
-        while (i < input.len and input[i] != '\n') : (i+=1) {}
-        if (i < input.len) {
-            return i+1;
-        }
         return i;
     }
 
@@ -1010,7 +1009,7 @@ pub const Parser = struct {
         }
     }
 
-    pub fn parseKVs(self: *Parser, input: []const u8, offset_in: usize, visited: *VisitedNode, comptime T: type, value: *T) !usize {
+    fn parseKVs(self: *Parser, input: []const u8, offset_in: usize, visited: *VisitedNode, comptime T: type, value: *T) !usize {
         if (T == Value and value.* != .Table) {
             return ParseError.IncorrectDataType;
         }
@@ -1025,6 +1024,7 @@ pub const Parser = struct {
         return offset;
     }
 
+    // parse parses the given input as a TOML data.
     pub fn parse(self: *Parser, comptime T: type, input: []const u8) !T {
         var visited = VisitedNode.init(self.allocator);
         defer visited.deinit();
