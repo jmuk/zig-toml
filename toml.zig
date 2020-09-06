@@ -290,7 +290,32 @@ pub const Parser = struct {
         return i;
     }
 
+    fn checkSignedPattern(self: *Parser, input: []const u8, offset: usize, pattern: []const u8) ?usize {
+        var i = offset;
+        if (input[i] == '+' or input[i] == '-')
+            i+=1;
+        if (i+pattern.len > input.len)
+            return null;
+        if (!mem.eql(u8, input[i..(i+pattern.len)], pattern))
+            return null;
+        if (i+pattern.len == input.len or !ascii.isAlNum(input[i+pattern.len]))
+            return i+pattern.len;
+        return null;
+    }
+
     fn parseFloat(self: *Parser, input: []const u8, offset: usize, value: *f64) !usize {
+        if (self.checkSignedPattern(input, offset, "inf")) |out| {
+            if (input[offset] == '-') {
+                value.* = -std.math.inf(f64);
+            } else {
+                value.* = std.math.inf(f64);
+            }
+            return out;
+        }
+        if (self.checkSignedPattern(input, offset, "nan")) |out| {
+            value.* = std.math.nan(f64);
+            return out;
+        }
         var i = offset;
         var has_e = false;
         var has_num = false;
@@ -527,16 +552,18 @@ pub const Parser = struct {
         return result;
     }
 
-    fn parseArray(self: *Parser, input: []const u8, offset_in: usize, comptime T: type, v: *std.ArrayList(T)) anyerror!usize {
+    fn parseArray(self: *Parser, input: []const u8, offset_in: usize, visited: *VisitedNode, comptime T: type, v: *std.ArrayList(T)) anyerror!usize {
         if (input[offset_in] != '[') {
             return ParseError.FailedToParse;
         }
         var offset = offset_in+1;
         while (true) {
             offset = self.skipSpacesAndComments(input, offset);
+            if (input[offset] == ']')
+                return offset+1;
             var e = try self.createT(T);
             errdefer self.destroyT(T, e);
-            offset = try self.parseValue(input, offset, T, &e);
+            offset = try self.parseValue(input, offset, visited, T, &e);
             _ = try v.append(e);
             offset = self.skipSpacesAndComments(input, offset);
             if (input[offset] == ']') {
@@ -549,7 +576,28 @@ pub const Parser = struct {
         return ParseError.FailedToParse;
     }
 
-    fn parseValue(self: *Parser, input: []const u8, offset_in: usize, comptime T: type, v: *T) !usize {
+    fn parseInlineTable(self: *Parser, input: []const u8, offset_in: usize, visited: *VisitedNode, comptime T: type, v: *T) !usize {
+        if (input[offset_in] != '{')
+            return ParseError.FailedToParse;
+        
+        var offset = offset_in+1;
+        while (true) {
+            offset = self.skipSpacesAndComments(input, offset);
+            if (input[offset] == '}')
+                return offset+1;
+            offset = try self.parseAssign(input, offset, visited, T, v);
+            offset = self.skipSpacesAndComments(input, offset);
+            if (input[offset] == '}') {
+                return offset+1;
+            } else if (input[offset] != ',') {
+                return ParseError.FailedToParse;
+            }
+            offset+=1;
+        }
+        return ParseError.FailedToParse;
+    }
+
+    fn parseValue(self: *Parser, input: []const u8, offset_in: usize, visited: *VisitedNode, comptime T: type, v: *T) !usize {
         var offset = self.skipSpaces(input, offset_in);
         if (T == Value) {
             if (input[offset] == '"' or input[offset] == '\'') {
@@ -566,9 +614,13 @@ pub const Parser = struct {
             } else if (input[offset] == '[') {
                 var a = std.ArrayList(Value).init(self.allocator);
                 errdefer a.deinit();
-                offset = try self.parseArray(input, offset, Value, &a);
+                offset = try self.parseArray(input, offset, visited, Value, &a);
                 v.* = Value{.Array = a};
                 return offset;
+            } else if (input[offset] == '{') {
+                v.* = Value{.Table = Table.init(self.allocator)};
+                errdefer v.deinit();
+                return self.parseInlineTable(input, offset, visited, Value, v);
             }
             var f: f64 = 0.0;
             if (self.parseFloat(input, offset, &f)) |offset_out| {
@@ -596,7 +648,7 @@ pub const Parser = struct {
                 if (ptr.size == .One) {
                     v.* = try self.allocator.create(ptr.child);
                     errdefer self.allocator.destroy(v.*);
-                    return self.parseValue(input, offset, ptr.child, v.*);
+                    return self.parseValue(input, offset, visited, ptr.child, v.*);
                 }
                 var allocator = if (ptr.size == .C)
                     std.heap.c_allocator
@@ -608,7 +660,7 @@ pub const Parser = struct {
                 offset = try if (ptr.child == u8)
                     self.parseString(input, offset, &a)
                 else
-                    self.parseArray(input, offset, ptr.child, &a)
+                    self.parseArray(input, offset, visited, ptr.child, &a)
                 ;
                 v.* = a.items;
                 return offset;
@@ -619,7 +671,7 @@ pub const Parser = struct {
                 if (arr.child_type == u8) {
                     offset = try self.parseString(input, offset, &a);
                 } else {
-                    offset = try self.parseArray(input, offset, ptr.child, &a);
+                    offset = try self.parseArray(input, offset, visited, ptr.child, &a);
                 }
                 for (a.items) |item, i| {
                     if (i < arr.len) {
@@ -628,8 +680,9 @@ pub const Parser = struct {
                 }
                 return offset;
             },
+            .Struct =>
+                return self.parseInlineTable(input, offset, visited, T, v),
             else => return ParseError.IncorrectDataType,
-            // TODO: struct
         }
     }
 
@@ -647,7 +700,7 @@ pub const Parser = struct {
                 }
                 try visited.markVisited(key, VisitType.Keyvalue);
                 var nv = Value{.Bool = false};
-                var offset = try self.parseValue(input, offset_in, Value, &nv);
+                var offset = try self.parseValue(input, offset_in, visited, Value, &nv);
                 _ = try v.*.Table.put(key, nv);
                 return offset;
             } else {
@@ -658,7 +711,7 @@ pub const Parser = struct {
                 inline for (ti.Struct.fields) |field| {
                     if (mem.eql(u8, key.items, field.name)) {
                         try visited.markVisited(key, VisitType.Keyvalue);
-                        return self.parseValue(input, offset_in, field.field_type, &(@field(v, field.name)));
+                        return self.parseValue(input, offset_in, visited, field.field_type, &(@field(v, field.name)));
                     }
                 }
                 return ParseError.FieldNotFound;
@@ -1369,6 +1422,14 @@ test "parseFloat" {
     expect(f == 0.2e-1);
     expect((try parser.parseFloat("1.e+2", 0, &f)) == 5);
     expect(f == 1e+2);
+    expect((try parser.parseFloat("inf", 0, &f)) == 3);
+    expect(f == std.math.inf(f64));
+    expect((try parser.parseFloat("-inf", 0, &f)) == 4);
+    expect(f == -std.math.inf(f64));
+    expect((try parser.parseFloat("nan", 0, &f)) == 3);
+    expect(std.math.isNan(f));
+    expect((try parser.parseFloat("+nan", 0, &f)) == 4);
+    expect(std.math.isNan(f));
 }
 
 test "parseString" {
@@ -1485,10 +1546,30 @@ test "parseArray" {
 
     var a = std.ArrayList(Value).init(allocator);
     defer a.deinit();
-    expect((try parser.parseArray("[ 42, 43.0,\n true, false ]", 0, Value, &a)) == 26);
+    var v = VisitedNode.init(allocator);
+    defer v.deinit();
+    expect((try parser.parseArray("[ 42, 43.0,\n true, false ]", 0, &v, Value, &a)) == 26);
     expect(a.items.len == 4);
     expect(a.items[0].Int == 42);
     expect(a.items[1].Float == 43.0);
     expect(a.items[2].Bool);
     expect(!a.items[3].Bool);
+}
+
+test "parseInlineTable" {
+    var tester = testing.LeakCountAllocator.init(std.heap.page_allocator);
+    defer tester.validate() catch {};
+    var allocator = &tester.allocator;
+    var parser = try Parser.init(allocator);
+    defer allocator.destroy(parser);
+
+    var t = Value{.Table = Table.init(allocator)};
+    defer t.deinit();
+    var v = VisitedNode.init(allocator);
+    defer v.deinit();
+    expect((try parser.parseInlineTable("{ x = 1, y = 2 }",
+        0, &v, Value, &t)) == 16);
+    expect(t.Table.size == 2);
+    expect(getS(t.Table, "x").?.value.Int == 1);
+    expect(getS(t.Table, "y").?.value.Int == 2);
 }
