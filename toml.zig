@@ -393,6 +393,8 @@ pub const Parser = struct {
         if (hasPrefix(input[start..], "\"\"")) {
             start+=2;
             multiLine = true;
+            if (start < input.len and input[start] == '\n')
+                start+=1;
         }
         var end = start;
         var inSkippingSpaces = false;
@@ -457,7 +459,16 @@ pub const Parser = struct {
             } else if (!multiLine and input[end] == '"') {
                 return end+1;
             } else if (multiLine and hasPrefix(input[end..], "\"\"\"")) {
-                return end+3;
+                end+=3;
+                if (end < input.len and input[end] == '"') {
+                    _ = try s.append('"');
+                    end+=1;
+                    if (end < input.len and input[end] == '"') {
+                        _ = try s.append('"');
+                        end+=1;
+                    }
+                }
+                return end;
             } else if (multiLine and inSkippingSpaces and (ascii.isSpace(input[end]) or input[end] == '\n')) {
                 // do nothing, skipping
                 continue;
@@ -480,9 +491,8 @@ pub const Parser = struct {
         if (hasPrefix(input[start..], "''")) {
             start+=2;
             multiLine = true;
-            if (input[start] == '\n') {
+            if (start < input.len and input[start] == '\n')
                 start+=1;
-            }
         }
         var end = start;
         while (end < input.len) : (end += 1) {
@@ -702,10 +712,9 @@ pub const Parser = struct {
     }
 
     fn lookupAndParseValue(self: *Parser, input: []const u8, offset_in: usize, keys: []Key, visited: *VisitedNode, comptime T: type, v: *T) anyerror!usize {
-        var key = keys[0];
-        errdefer for (keys[1..(keys.len)]) |k| {
-            k.deinit();
-        };
+        var key = Key.init(self.allocator);
+        try key.appendSlice(keys[0].items);
+
         if (keys.len == 1) {
             if (visited.visitedType(key) != .None) {
                 key.deinit();
@@ -738,16 +747,19 @@ pub const Parser = struct {
         if (T == Value) {
             if (v.* == .Table) {
                 var gpr = try v.*.Table.getOrPut(key);
-                if (!gpr.found_existing) {
+                defer if (gpr.found_existing)
+                    key.deinit();
+                if (gpr.found_existing) {
+                    if (gpr.kv.value != .Table) {
+                        return ParseError.IncorrectDataType;
+                    }
+                } else {
                     gpr.kv.value = Value{.Table = Table.init(self.allocator)};
                     try visited.markVisited(key, VisitType.Keyvalue);
                 }
-                var offset = try self.lookupAndParseValue(
+                return self.lookupAndParseValue(
                     input, offset_in, keys[1..(keys.len)], visited.getChild(key).?,
                     Value, &gpr.kv.value);
-                if (gpr.found_existing)
-                    key.deinit();
-                return offset;
             }
             return ParseError.IncorrectDataType;
         }
@@ -785,6 +797,9 @@ pub const Parser = struct {
     fn parseAssign(self: *Parser, input: []const u8, offset_in: usize, visited: *VisitedNode, comptime T: type, data: *T) !usize {
         var keys = try self.parseKey(input, offset_in);
         defer keys.keys.deinit();
+        defer for (keys.keys.items) |k| {
+            k.deinit();
+        };
         if (input[keys.offset] != '=') {
             keys.deinit();
             return ParseError.FailedToParse;
@@ -800,10 +815,8 @@ pub const Parser = struct {
     fn lookupAndParseKVs(
             self: *Parser, input: []const u8, offset_in: usize,
             keys: []Key, is_array: bool, visited: *VisitedNode, comptime T: type, data: *T) !usize {
-        var key = keys[0];
-        errdefer for (keys[1..(keys.len)]) |k| {
-            k.deinit();
-        };
+        var key = Key.init(self.allocator);
+        try key.appendSlice(keys[0].items);
         var vtype = visited.visitedType(key);
         if (keys.len == 1) {
             if (vtype == .Keyvalue)
@@ -983,6 +996,9 @@ pub const Parser = struct {
         }
         var keys = try self.parseKey(input, offset+count);
         defer keys.keys.deinit();
+        defer for (keys.keys.items) |k| {
+            k.deinit();
+        };
         var i: usize = 0;
         while (i < count) : (i += 1) {
             if (input[keys.offset+i] != ']') {
@@ -1753,6 +1769,191 @@ test "example4" {
     expect(getS(getS(parsed.Table, "site").?.value.Table, "google.com").?.value.Bool);
 }
 
+test "example5" {
+    var tester = testing.LeakCountAllocator.init(std.heap.page_allocator);
+    defer tester.validate() catch {};
+    var allocator = &tester.allocator;
+    var parser = try Parser.init(allocator);
+    defer allocator.destroy(parser);
+
+    var parsed = try parser.parse(Value, "3.14159 = \"pi\"");
+    defer parsed.deinit();
+    expect(checkS(getS(parsed.Table, "3").?.value.Table, "14159", "pi"));
+}
+
+test "example6" {
+    var tester = testing.LeakCountAllocator.init(std.heap.page_allocator);
+    defer tester.validate() catch {};
+    var allocator = &tester.allocator;
+    var parser = try Parser.init(allocator);
+    defer allocator.destroy(parser);
+
+    var parsed = try parser.parse(Value,
+        \\# This makes the key "fruit" into a table.
+        \\fruit.apple.smooth = true
+        \\
+        \\# So then you can add to the table "fruit" like so:
+        \\fruit.orange = 2
+    );
+    defer parsed.deinit();
+    expect(getS(getS(getS(parsed.Table, "fruit").?.value.Table, "apple").?.value.Table, "smooth").?.value.Bool);
+    expect(getS(getS(parsed.Table, "fruit").?.value.Table, "orange").?.value.Int == 2);
+}
+
+fn deepEqual(v1: Value, v2: Value) bool {
+    switch (v1) {
+        .Int => |i| return (v2 == .Int) and i == v2.Int,
+        .Float => |f1| return (v2 == .Float) and f1 == v2.Float,
+        .Bool => |b1| return (v2 == .Bool) and b1 == v2.Bool,
+        .String => |s1| return (v2 == .String) and mem.eql(u8, s1.items, v2.String.items),
+        .Array => |a1| {
+            if (v2 != .Array)
+                return false;
+            if (a1.items.len != v2.Array.items.len)
+                return false;
+            for (a1.items) |e, i| {
+                if (!deepEqual(e, v2.Array.items[i]))
+                    return false;
+            }
+            return true;
+        },
+        .Table => |t1| {
+            if (v2 != .Table)
+                return false;
+            if (t1.size != v2.Table.size)
+                return false;
+            var iter = t1.iterator();
+            while (iter.next()) |kv| {
+                if (v2.Table.get(kv.key)) |kv2| {
+                    if (!deepEqual(kv.value, kv2.value))
+                        return false;
+                } else {
+                    return false;
+                }
+            }
+            return true;
+        },
+    }
+}
+
+test "example7" {
+    var tester = testing.LeakCountAllocator.init(std.heap.page_allocator);
+    defer tester.validate() catch {};
+    var allocator = &tester.allocator;
+    var parser = try Parser.init(allocator);
+    defer allocator.destroy(parser);
+
+    var p1 = try parser.parse(Value,
+        \\apple.type = "fruit"
+        \\orange.type = "fruit"
+        \\
+        \\apple.skin = "thin"
+        \\orange.skin = "thick"
+        \\
+        \\apple.color = "red"
+        \\orange.color = "orange"
+    );
+    defer p1.deinit();
+    var p2 = try parser.parse(Value,
+        \\apple.type = "fruit"
+        \\apple.skin = "thin"
+        \\apple.color = "red"
+        \\
+        \\orange.type = "fruit"
+        \\orange.skin = "thick"
+        \\orange.color = "orange"
+    );
+    defer p2.deinit();
+    expect(deepEqual(p1, p2));
+}
+
+test "exapmle8" {
+    var tester = testing.LeakCountAllocator.init(std.heap.page_allocator);
+    defer tester.validate() catch {};
+    var allocator = &tester.allocator;
+    var parser = try Parser.init(allocator);
+    defer allocator.destroy(parser);
+
+    var parsed = try parser.parse(Value,
+        \\str = "I'm a string. \"You can quote me\". Name\tJos\u00E9\nLocation\tSF."
+        \\str1 = """
+        \\Roses are red
+        \\Violets are blue"""
+        \\# On a Unix system, the above multi-line string will most likely be the same as:
+        \\str2 = "Roses are red\nViolets are blue"
+        \\
+        \\# On a Windows system, it will most likely be equivalent to:
+        \\str3 = "Roses are red\r\nViolets are blue"
+        \\str4 = "The quick brown fox jumps over the lazy dog."
+        \\
+        \\str5 = """
+        \\The quick brown \
+        \\
+        \\
+        \\  fox jumps over \
+        \\    the lazy dog."""
+        \\
+        \\str6 = """\
+        \\       The quick brown \
+        \\       fox jumps over \
+        \\       the lazy dog.\
+        \\       """
+        \\str7 = """Here are two quotation marks: "". Simple enough."""
+        \\# str5 = """Here are three quotation marks: """."""  # INVALID
+        \\str8 = """Here are three quotation marks: ""\"."""
+        \\str9 = """Here are fifteen quotation marks: ""\"""\"""\"""\"""\"."""
+        \\
+        \\# "This," she said, "is just a pointless statement."
+        \\str10 = """"This," she said, "is just a pointless statement.""""
+        \\winpath  = 'C:\Users\nodejs\templates'
+        \\winpath2 = '\\ServerX\admin$\system32\'
+        \\quoted   = 'Tom "Dubs" Preston-Werner'
+        \\regex    = '<\i\c*\s*>'
+        \\regex2 = '''I [dw]on't need \d{2} apples'''
+        \\lines  = '''
+        \\The first newline is
+        \\trimmed in raw strings.
+        \\   All other whitespace
+        \\   is preserved.
+        \\'''
+        \\quot15 = '''Here are fifteen quotation marks: """""""""""""""'''
+        \\
+        \\# apos15 = '''Here are fifteen apostrophes: ''''''''''''''''''  # INVALID
+        \\apos15 = "Here are fifteen apostrophes: '''''''''''''''"
+        \\
+        \\# 'That's still pointless', she said.
+        \\str11 = ''''That's still pointless', she said.'''
+    );
+    defer parsed.deinit();
+
+    expect(checkS(parsed.Table, "str", "I'm a string. \"You can quote me\". Name\tJos\xC3\xA9\nLocation\tSF."));
+    expect(checkS(parsed.Table, "str1", "Roses are red\nViolets are blue"));
+    expect(checkS(parsed.Table, "str2", "Roses are red\nViolets are blue"));
+    expect(checkS(parsed.Table, "str3", "Roses are red\r\nViolets are blue"));
+    expect(checkS(parsed.Table, "str4", "The quick brown fox jumps over the lazy dog."));
+    expect(checkS(parsed.Table, "str5", "The quick brown fox jumps over the lazy dog."));
+    expect(checkS(parsed.Table, "str6", "The quick brown fox jumps over the lazy dog."));
+    expect(checkS(parsed.Table, "str7", "Here are two quotation marks: \"\". Simple enough."));
+    expect(checkS(parsed.Table, "str8", "Here are three quotation marks: \"\"\"."));
+    expect(checkS(parsed.Table, "str9", "Here are fifteen quotation marks: \"\"\"\"\"\"\"\"\"\"\"\"\"\"\"."));
+    expect(checkS(parsed.Table, "str10", "\"This,\" she said, \"is just a pointless statement.\""));
+    expect(checkS(parsed.Table, "winpath", "C:\\Users\\nodejs\\templates"));
+    expect(checkS(parsed.Table, "winpath2", "\\\\ServerX\\admin$\\system32\\"));
+    expect(checkS(parsed.Table, "quoted", "Tom \"Dubs\" Preston-Werner"));
+    expect(checkS(parsed.Table, "regex", "<\\i\\c*\\s*>"));
+    expect(checkS(parsed.Table, "regex2", "I [dw]on't need \\d{2} apples"));
+    expect(checkS(parsed.Table, "lines",
+        \\The first newline is
+        \\trimmed in raw strings.
+        \\   All other whitespace
+        \\   is preserved.
+        \\
+    ));
+    expect(checkS(parsed.Table, "quot15", "Here are fifteen quotation marks: \"\"\"\"\"\"\"\"\"\"\"\"\"\"\""));
+    expect(checkS(parsed.Table, "apos15", "Here are fifteen apostrophes: '''''''''''''''"));
+    expect(checkS(parsed.Table, "str11", "'That's still pointless', she said."));
+}
+
 test "examples-invalid" {
     var tester = testing.LeakCountAllocator.init(std.heap.page_allocator);
     defer tester.validate() catch {};
@@ -1764,6 +1965,17 @@ test "examples-invalid" {
         "key = # INVALID",
         "first = \"Tom\" last = \"Preston-Werner\" # INVALID",
         "= \"no key name\"  # INVALID",
+        \\# DO NOT DO THIS
+        \\name = "Tom"
+        \\name = "Pradyun"
+        ,
+        \\# This defines the value of fruit.apple to be an integer.
+        \\fruit.apple = 1
+        \\
+        \\# But then this treats fruit.apple like it's a table.
+        \\# You can't turn an integer into a table.
+        \\fruit.apple.smooth = true
+        ,
     };
     for (invalids) |invalid| {
         if (parser.parse(Value, invalid)) |parsed| {
