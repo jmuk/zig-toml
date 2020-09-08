@@ -1997,6 +1997,75 @@ test "example9" {
     expect(getS(parsed.Table, "bin1").?.value.Int == 0b11010110);
 }
 
+test "examples10" {
+    var tester = testing.LeakCountAllocator.init(std.heap.page_allocator);
+    defer tester.validate() catch {};
+    var allocator = &tester.allocator;
+    var parser = try Parser.init(allocator);
+    defer allocator.destroy(parser);
+
+    var parsed = try parser.parse(Value,
+        \\integers = [ 1, 2, 3 ]
+        \\colors = [ "red", "yellow", "green" ]
+        \\nested_array_of_int = [ [ 1, 2 ], [3, 4, 5] ]
+        \\nested_mixed_array = [ [ 1, 2 ], ["a", "b", "c"] ]
+        \\string_array = [ "all", 'strings', """are the same""", '''type''' ]
+        \\
+        \\# Mixed-type arrays are allowed
+        \\numbers = [ 0.1, 0.2, 0.5, 1, 2, 5 ]
+        \\contributors = [
+        \\  "Foo Bar <foo@example.com>",
+        \\  { name = "Baz Qux", email = "bazqux@example.com", url = "https://example.com/bazqux" }
+        \\]
+        \\integers2 = [
+        \\  1, 2, 3
+        \\]
+        \\
+        \\integers3 = [
+        \\  1,
+        \\  2, # this is ok
+        \\]
+    );
+    defer parsed.deinit();
+
+    expect(getS(parsed.Table, "integers").?.Array.items[0].Int == 1);
+    expect(getS(parsed.Table, "integers").?.Array.items[1].Int == 2);
+    expect(getS(parsed.Table, "integers").?.Array.items[2].Int == 3);
+    expect(mem.eql(u8, getS(parsed.Table, "colors").?.Array.items[0].String.items, "red"));
+    expect(mem.eql(u8, getS(parsed.Table, "colors").?.Array.items[1].String.items, "yellow"));
+    expect(mem.eql(u8, getS(parsed.Table, "colors").?.Array.items[2].String.items, "green"));
+    expect(getS(parsed.Table, "nested_array_of_int").?.Array.items[0].Array.items[0].Int == 1);
+    expect(getS(parsed.Table, "nested_array_of_int").?.Array.items[0].Array.items[1].Int == 2);
+    expect(getS(parsed.Table, "nested_array_of_int").?.Array.items[1].Array.items[0].Int == 3);
+    expect(getS(parsed.Table, "nested_array_of_int").?.Array.items[1].Array.items[1].Int == 4);
+    expect(getS(parsed.Table, "nested_array_of_int").?.Array.items[1].Array.items[1].Int == 5);
+    expect(getS(parsed.Table, "nested_mixed_array").?.Array.items[0].Array.items[0].Int == 1);
+    expect(getS(parsed.Table, "nested_mixed_array").?.Array.items[0].Array.items[1].Int == 2);
+    expect(mem.eql(u8, getS(parsed.Table, "nested_mixed_array").?.Array.items[1].Array.items[0].String.items, "a");
+    expect(mem.eql(u8, getS(parsed.Table, "nested_mixed_array").?.Array.items[1].Array.items[1].String.items, "b");
+    expect(mem.eql(u8, getS(parsed.Table, "nested_mixed_array").?.Array.items[1].Array.items[2].String.items, "c");
+    expect(mem.eql(u8, getS(parsed.Table, "string_array").?.Array.items[0].String.items, "all"));
+    expect(mem.eql(u8, getS(parsed.Table, "string_array").?.Array.items[1].String.items, "strings"));
+    expect(mem.eql(u8, getS(parsed.Table, "string_array").?.Array.items[2].String.items, "are the same"));
+    expect(mem.eql(u8, getS(parsed.Table, "string_array").?.Array.items[2].String.items, "type"));
+    expect(getS(parsed.Table, "numbers").?.Array.items[0].Int == 0.1);
+    expect(getS(parsed.Table, "numbers").?.Array.items[1].Int == 0.2);
+    expect(getS(parsed.Table, "numbers").?.Array.items[2].Int == 0.5);
+    expect(getS(parsed.Table, "numbers").?.Array.items[3].Int == 1);
+    expect(getS(parsed.Table, "numbers").?.Array.items[4].Int == 2);
+    expect(getS(parsed.Table, "numbers").?.Array.items[5].Int == 5);
+    expect(mem.eql(u8, getS(parsed.Table, "contributors").?.Array.items[0].String.items, "Foo Bar <foo@example.com>"));
+    expect(mem.eql(u8, getS(getS(parsed.Table, "contributors").?.Array.items[0].Table, "name"), "Baz Qux"));
+    expect(mem.eql(u8, getS(getS(parsed.Table, "contributors").?.Array.items[0].Table, "email"), "bazqux@example.com"));
+    expect(mem.eql(u8, getS(getS(parsed.Table, "contributors").?.Array.items[0].Table, "url"), "https://example.com/bazqux"));
+    expect(getS(parsed.Table, "integers2").?.Array.items[0].Int == 1);
+    expect(getS(parsed.Table, "integers2").?.Array.items[1].Int == 2);
+    expect(getS(parsed.Table, "integers2").?.Array.items[2].Int == 3);
+    expect(getS(parsed.Table, "integers3").?.Array.items[0].Int == 1);
+    expect(getS(parsed.Table, "integers3").?.Array.items[1].Int == 2);
+    expect(getS(parsed.Table, "integers3").?.Array.items.size == 2);
+}
+
 test "examples-invalid" {
     var tester = testing.LeakCountAllocator.init(std.heap.page_allocator);
     defer tester.validate() catch {};
