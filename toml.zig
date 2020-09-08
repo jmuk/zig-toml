@@ -84,6 +84,11 @@ pub const ParseError = error {
 
     // No related field is found for a key.
     FieldNotFound,
+
+    // Expected to see a linebeak but could not found.
+    LinebreakExpected,
+
+    AlreadyMarkedAsVisited,
 };
 
 const VisitType = enum {
@@ -127,6 +132,9 @@ const VisitedNode = struct {
         var copiedKey = Key.init(self.allocator);
         errdefer copiedKey.deinit();
         _ = try copiedKey.appendSlice(key.items);
+        if (self.children.get(copiedKey)) |_| {
+            return ParseError.AlreadyMarkedAsVisited;
+        }
         var out = try self.children.put(copiedKey, node);
     }
 
@@ -176,16 +184,24 @@ pub const Parser = struct {
         return i;
     }
 
-    fn skipSpacesAndComments(self: *Parser, input: []const u8, offset: usize) usize {
+    fn skipSpacesAndCommentsWithLinebreak(self: *Parser, input: []const u8, offset: usize, has_linebreak: *bool) usize {
         var i = offset;
         while (i < input.len) : (i+=1) {
             if (input[i] == '#') {
                 while (i < input.len and input[i] != '\n') : (i+=1) {}
+                has_linebreak.* = true;
+            } else if (input[i] == '\n') {
+                has_linebreak.* = true;
             } else if (!ascii.isSpace(input[i])) {
                 return i;
             }
         }
         return i;
+    }
+
+    fn skipSpacesAndComments(self: *Parser, input: []const u8, offset: usize) usize {
+        var has_linebreak = false;
+        return self.skipSpacesAndCommentsWithLinebreak(input, offset, &has_linebreak);
     }
 
     fn parseTrue(self: *Parser, input: []const u8, offset: usize, value: *bool) ParseError!usize {
@@ -374,7 +390,7 @@ pub const Parser = struct {
         }
         var start = offset+1;
         var multiLine = false;
-        if (hasPrefix(input[offset..], "\"\"")) {
+        if (hasPrefix(input[start..], "\"\"")) {
             start+=2;
             multiLine = true;
         }
@@ -691,9 +707,12 @@ pub const Parser = struct {
             k.deinit();
         };
         if (keys.len == 1) {
-            if (visited.visitedType(key) != .None)
+            if (visited.visitedType(key) != .None) {
+                key.deinit();
                 return ParseError.DuplicatedKey;
+            }
             if (T == Value) {
+                errdefer key.deinit();
                 if (v.* != .Table) {
                     return ParseError.IncorrectDataType;
                 }
@@ -719,15 +738,16 @@ pub const Parser = struct {
         if (T == Value) {
             if (v.* == .Table) {
                 var gpr = try v.*.Table.getOrPut(key);
-                if (gpr.found_existing) {
-                    key.deinit();
-                } else {
+                if (!gpr.found_existing) {
                     gpr.kv.value = Value{.Table = Table.init(self.allocator)};
                     try visited.markVisited(key, VisitType.Keyvalue);
                 }
-                return self.lookupAndParseValue(
+                var offset = try self.lookupAndParseValue(
                     input, offset_in, keys[1..(keys.len)], visited.getChild(key).?,
                     Value, &gpr.kv.value);
+                if (gpr.found_existing)
+                    key.deinit();
+                return offset;
             }
             return ParseError.IncorrectDataType;
         }
@@ -971,6 +991,12 @@ pub const Parser = struct {
             }
         }
         offset = keys.offset+count;
+        var has_linebreak = false;
+        offset = self.skipSpacesAndCommentsWithLinebreak(input, offset, &has_linebreak);
+        if (offset >= input.len)
+            return offset;
+        if (!has_linebreak)
+            return ParseError.LinebreakExpected;
         return self.lookupAndParseKVs(input, offset, keys.keys.items, count > 1, visited, T, data);
     }
 
@@ -1014,12 +1040,16 @@ pub const Parser = struct {
             return ParseError.IncorrectDataType;
         }
         var offset: usize = offset_in;
+        offset = self.skipSpacesAndComments(input, offset);
         while (offset < input.len) {
-            offset = self.skipSpacesAndComments(input, offset);
-            if (offset >= input.len or input[offset] == '[') {
+            if (input[offset] == '[') {
                 return offset;
             }
             offset = try self.parseAssign(input, offset, visited, T, value);
+            var has_linebreak = false;
+            offset = self.skipSpacesAndCommentsWithLinebreak(input, offset, &has_linebreak);
+            if (offset < input.len and !has_linebreak)
+                return ParseError.LinebreakExpected;
         }
         return offset;
     }
@@ -1034,15 +1064,13 @@ pub const Parser = struct {
             .Pointer => |ptr| self.parseKVs(input, 0, &visited, ptr.child, top),
             else => self.parseKVs(input, 0, &visited, T, &top),
         };
+        offset = self.skipSpacesAndComments(input, offset);
         while (offset < input.len) {
-            offset = self.skipSpacesAndComments(input, offset);
-            if (offset >= input.len) {
-                break;
-            }
             offset = try switch(@typeInfo(T)) {
                 .Pointer => |ptr| self.parseBracket(input, offset, &visited, ptr.child, top),
                 else => self.parseBracket(input, offset, &visited, T, &top),
             };
+            offset = self.skipSpacesAndComments(input, offset);
         }
         return top;
     }
@@ -1641,4 +1669,107 @@ test "parseInlineTable" {
     expect(t.Table.size == 2);
     expect(getS(t.Table, "x").?.value.Int == 1);
     expect(getS(t.Table, "y").?.value.Int == 2);
+}
+
+// examples are from https://toml.io/en/v1.0.0-rc.1.
+test "examples1" {
+    var tester = testing.LeakCountAllocator.init(std.heap.page_allocator);
+    defer tester.validate() catch {};
+    var allocator = &tester.allocator;
+    var parser = try Parser.init(allocator);
+    defer allocator.destroy(parser);
+
+    var parsed = try parser.parse(Value,
+        \\# This is a full-line comment
+        \\key = "value"  # This is a comment at the end of a line
+        \\another = "# This is not a comment"
+    );
+    defer parsed.deinit();
+    expect(checkS(parsed.Table, "key", "value"));
+    expect(checkS(parsed.Table, "another", "# This is not a comment"));
+}
+
+test "examples2" {
+    var tester = testing.LeakCountAllocator.init(std.heap.page_allocator);
+    defer tester.validate() catch {};
+    var allocator = &tester.allocator;
+    var parser = try Parser.init(allocator);
+    defer allocator.destroy(parser);
+
+    var parsed = try parser.parse(Value,
+        \\key = "value"
+        \\bare_key = "value"
+        \\bare-key = "value"
+        \\1234 = "value"
+        \\"127.0.0.1" = "value"
+        \\"character encoding" = "value"
+        \\"ʎǝʞ" = "value"
+        \\'key2' = "value"
+        \\'quoted "value"' = "value"
+    );
+    defer parsed.deinit();
+    expect(checkS(parsed.Table, "key", "value"));
+    expect(checkS(parsed.Table, "bare_key", "value"));
+    expect(checkS(parsed.Table, "bare-key", "value"));
+    expect(checkS(parsed.Table, "1234", "value"));
+    expect(checkS(parsed.Table, "127.0.0.1", "value"));
+    expect(checkS(parsed.Table, "character encoding", "value"));
+    expect(checkS(parsed.Table, "ʎǝʞ", "value"));
+    expect(checkS(parsed.Table, "key2", "value"));
+    expect(checkS(parsed.Table, "quoted \"value\"", "value"));
+}
+
+test "example3" {
+    var tester = testing.LeakCountAllocator.init(std.heap.page_allocator);
+    defer tester.validate() catch {};
+    var allocator = &tester.allocator;
+    var parser = try Parser.init(allocator);
+    defer allocator.destroy(parser);
+
+    var parsed = try parser.parse(Value,
+        \\"" = "blank"     # VALID but discouraged
+    );
+    defer parsed.deinit();
+    expect(checkS(parsed.Table, "", "blank"));
+}
+
+test "example4" {
+    var tester = testing.LeakCountAllocator.init(std.heap.page_allocator);
+    defer tester.validate() catch {};
+    var allocator = &tester.allocator;
+    var parser = try Parser.init(allocator);
+    defer allocator.destroy(parser);
+
+    var parsed = try parser.parse(Value,
+        \\name = "Orange"
+        \\physical.color = "orange"
+        \\physical.shape = "round"
+        \\site."google.com" = true
+    );
+    defer parsed.deinit();
+    expect(checkS(parsed.Table, "name", "Orange"));
+    expect(checkS(getS(parsed.Table, "physical").?.value.Table, "color", "orange"));
+    expect(checkS(getS(parsed.Table, "physical").?.value.Table, "shape", "round"));
+    expect(getS(getS(parsed.Table, "site").?.value.Table, "google.com").?.value.Bool);
+}
+
+test "examples-invalid" {
+    var tester = testing.LeakCountAllocator.init(std.heap.page_allocator);
+    defer tester.validate() catch {};
+    var allocator = &tester.allocator;
+    var parser = try Parser.init(allocator);
+    defer allocator.destroy(parser);
+
+    var invalids = [_][]const u8 {
+        "key = # INVALID",
+        "first = \"Tom\" last = \"Preston-Werner\" # INVALID",
+        "= \"no key name\"  # INVALID",
+    };
+    for (invalids) |invalid| {
+        if (parser.parse(Value, invalid)) |parsed| {
+            std.debug.warn("Unexpectedly success of parsing for {} as {}\n", .{invalid, parsed});
+            parsed.deinit();
+            expect(false);
+        } else |err| {}
+    }
 }
