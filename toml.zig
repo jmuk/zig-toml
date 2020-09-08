@@ -32,6 +32,13 @@ pub fn getS(tbl: Table, key: []const u8) ?*Table.KV {
     }
 }
 
+pub fn getSV(tbl: Table, key: []const u8) ?Value {
+    if (getS(tbl, key)) |kv| {
+        return kv.value;
+    }
+    return null;
+}
+
 pub const ValueTag = enum {
     String, Int, Float, Bool, Table, Array,
 };
@@ -2028,42 +2035,83 @@ test "examples10" {
     );
     defer parsed.deinit();
 
-    expect(getS(parsed.Table, "integers").?.Array.items[0].Int == 1);
-    expect(getS(parsed.Table, "integers").?.Array.items[1].Int == 2);
-    expect(getS(parsed.Table, "integers").?.Array.items[2].Int == 3);
-    expect(mem.eql(u8, getS(parsed.Table, "colors").?.Array.items[0].String.items, "red"));
-    expect(mem.eql(u8, getS(parsed.Table, "colors").?.Array.items[1].String.items, "yellow"));
-    expect(mem.eql(u8, getS(parsed.Table, "colors").?.Array.items[2].String.items, "green"));
-    expect(getS(parsed.Table, "nested_array_of_int").?.Array.items[0].Array.items[0].Int == 1);
-    expect(getS(parsed.Table, "nested_array_of_int").?.Array.items[0].Array.items[1].Int == 2);
-    expect(getS(parsed.Table, "nested_array_of_int").?.Array.items[1].Array.items[0].Int == 3);
-    expect(getS(parsed.Table, "nested_array_of_int").?.Array.items[1].Array.items[1].Int == 4);
-    expect(getS(parsed.Table, "nested_array_of_int").?.Array.items[1].Array.items[1].Int == 5);
-    expect(getS(parsed.Table, "nested_mixed_array").?.Array.items[0].Array.items[0].Int == 1);
-    expect(getS(parsed.Table, "nested_mixed_array").?.Array.items[0].Array.items[1].Int == 2);
-    expect(mem.eql(u8, getS(parsed.Table, "nested_mixed_array").?.Array.items[1].Array.items[0].String.items, "a");
-    expect(mem.eql(u8, getS(parsed.Table, "nested_mixed_array").?.Array.items[1].Array.items[1].String.items, "b");
-    expect(mem.eql(u8, getS(parsed.Table, "nested_mixed_array").?.Array.items[1].Array.items[2].String.items, "c");
-    expect(mem.eql(u8, getS(parsed.Table, "string_array").?.Array.items[0].String.items, "all"));
-    expect(mem.eql(u8, getS(parsed.Table, "string_array").?.Array.items[1].String.items, "strings"));
-    expect(mem.eql(u8, getS(parsed.Table, "string_array").?.Array.items[2].String.items, "are the same"));
-    expect(mem.eql(u8, getS(parsed.Table, "string_array").?.Array.items[2].String.items, "type"));
-    expect(getS(parsed.Table, "numbers").?.Array.items[0].Int == 0.1);
-    expect(getS(parsed.Table, "numbers").?.Array.items[1].Int == 0.2);
-    expect(getS(parsed.Table, "numbers").?.Array.items[2].Int == 0.5);
-    expect(getS(parsed.Table, "numbers").?.Array.items[3].Int == 1);
-    expect(getS(parsed.Table, "numbers").?.Array.items[4].Int == 2);
-    expect(getS(parsed.Table, "numbers").?.Array.items[5].Int == 5);
-    expect(mem.eql(u8, getS(parsed.Table, "contributors").?.Array.items[0].String.items, "Foo Bar <foo@example.com>"));
-    expect(mem.eql(u8, getS(getS(parsed.Table, "contributors").?.Array.items[0].Table, "name"), "Baz Qux"));
-    expect(mem.eql(u8, getS(getS(parsed.Table, "contributors").?.Array.items[0].Table, "email"), "bazqux@example.com"));
-    expect(mem.eql(u8, getS(getS(parsed.Table, "contributors").?.Array.items[0].Table, "url"), "https://example.com/bazqux"));
-    expect(getS(parsed.Table, "integers2").?.Array.items[0].Int == 1);
-    expect(getS(parsed.Table, "integers2").?.Array.items[1].Int == 2);
-    expect(getS(parsed.Table, "integers2").?.Array.items[2].Int == 3);
-    expect(getS(parsed.Table, "integers3").?.Array.items[0].Int == 1);
-    expect(getS(parsed.Table, "integers3").?.Array.items[1].Int == 2);
-    expect(getS(parsed.Table, "integers3").?.Array.items.size == 2);
+    expect(getS(parsed.Table, "integers").?.value.Array.items[0].Int == 1);
+    expect(getS(parsed.Table, "integers").?.value.Array.items[1].Int == 2);
+    expect(getS(parsed.Table, "integers").?.value.Array.items[2].Int == 3);
+    expect(mem.eql(u8, getS(parsed.Table, "colors").?.value.Array.items[0].String.items, "red"));
+    expect(mem.eql(u8, getS(parsed.Table, "colors").?.value.Array.items[1].String.items, "yellow"));
+    expect(mem.eql(u8, getS(parsed.Table, "colors").?.value.Array.items[2].String.items, "green"));
+    expect(getS(parsed.Table, "nested_array_of_int").?.value.Array.items[0].Array.items[0].Int == 1);
+    expect(getS(parsed.Table, "nested_array_of_int").?.value.Array.items[0].Array.items[1].Int == 2);
+    expect(getS(parsed.Table, "nested_array_of_int").?.value.Array.items[1].Array.items[0].Int == 3);
+    expect(getS(parsed.Table, "nested_array_of_int").?.value.Array.items[1].Array.items[1].Int == 4);
+    expect(getS(parsed.Table, "nested_array_of_int").?.value.Array.items[1].Array.items[2].Int == 5);
+    expect(getS(parsed.Table, "nested_mixed_array").?.value.Array.items[0].Array.items[0].Int == 1);
+    expect(getS(parsed.Table, "nested_mixed_array").?.value.Array.items[0].Array.items[1].Int == 2);
+    expect(mem.eql(u8, getS(parsed.Table, "nested_mixed_array").?.value.Array.items[1].Array.items[0].String.items, "a"));
+    expect(mem.eql(u8, getS(parsed.Table, "nested_mixed_array").?.value.Array.items[1].Array.items[1].String.items, "b"));
+    expect(mem.eql(u8, getS(parsed.Table, "nested_mixed_array").?.value.Array.items[1].Array.items[2].String.items, "c"));
+    expect(mem.eql(u8, getS(parsed.Table, "string_array").?.value.Array.items[0].String.items, "all"));
+    expect(mem.eql(u8, getS(parsed.Table, "string_array").?.value.Array.items[1].String.items, "strings"));
+    expect(mem.eql(u8, getS(parsed.Table, "string_array").?.value.Array.items[2].String.items, "are the same"));
+    expect(mem.eql(u8, getS(parsed.Table, "string_array").?.value.Array.items[3].String.items, "type"));
+    expect(getS(parsed.Table, "numbers").?.value.Array.items[0].Float == 0.1);
+    expect(getS(parsed.Table, "numbers").?.value.Array.items[1].Float == 0.2);
+    expect(getS(parsed.Table, "numbers").?.value.Array.items[2].Float == 0.5);
+    expect(getS(parsed.Table, "numbers").?.value.Array.items[3].Int == 1);
+    expect(getS(parsed.Table, "numbers").?.value.Array.items[4].Int == 2);
+    expect(getS(parsed.Table, "numbers").?.value.Array.items[5].Int == 5);
+    expect(mem.eql(u8, getS(parsed.Table, "contributors").?.value.Array.items[0].String.items, "Foo Bar <foo@example.com>"));
+    expect(mem.eql(u8, getS(getS(parsed.Table, "contributors").?.value.Array.items[1].Table, "name").?.value.String.items, "Baz Qux"));
+    expect(mem.eql(u8, getS(getS(parsed.Table, "contributors").?.value.Array.items[1].Table, "email").?.value.String.items, "bazqux@example.com"));
+    expect(mem.eql(u8, getS(getS(parsed.Table, "contributors").?.value.Array.items[1].Table, "url").?.value.String.items, "https://example.com/bazqux"));
+    expect(getS(parsed.Table, "integers2").?.value.Array.items[0].Int == 1);
+    expect(getS(parsed.Table, "integers2").?.value.Array.items[1].Int == 2);
+    expect(getS(parsed.Table, "integers2").?.value.Array.items[2].Int == 3);
+    expect(getS(parsed.Table, "integers3").?.value.Array.items[0].Int == 1);
+    expect(getS(parsed.Table, "integers3").?.value.Array.items[1].Int == 2);
+    expect(getS(parsed.Table, "integers3").?.value.Array.items.len == 2);
+}
+
+test "example11" {
+    var tester = testing.LeakCountAllocator.init(std.heap.page_allocator);
+    defer tester.validate() catch {};
+    var allocator = &tester.allocator;
+    var parser = try Parser.init(allocator);
+    defer allocator.destroy(parser);
+
+    var parsed = try parser.parse(Value,
+        \\[table-1]
+        \\key1 = "some string"
+        \\key2 = 123
+        \\
+        \\[table-2]
+        \\key1 = "another string"
+        \\key2 = 456
+        \\[dog."tater.man"]
+        \\type.name = "pug"
+        \\[fruit]
+        \\apple.color = "red"
+        \\apple.taste.sweet = true
+        \\
+        \\# [fruit.apple]  # INVALID
+        \\# [fruit.apple.taste]  # INVALID
+        \\
+        // \\[fruit.apple.texture]  # you can add sub-tables
+        // \\smooth = true
+    );
+    defer parsed.deinit();
+    var tbl1 = getSV(parsed.Table, "table-1").?.Table;
+    expect(checkS(tbl1, "key1", "some string"));
+    expect(getSV(tbl1, "key2").?.Int == 123);
+    var tbl2 = getSV(parsed.Table, "table-2").?.Table;
+    expect(checkS(tbl2, "key1", "another string"));
+    expect(getSV(tbl2, "key2").?.Int == 456);
+    var taterman = getSV(getSV(parsed.Table, "dog").?.Table, "tater.man").?.Table;
+    expect(checkS(getSV(taterman, "type").?.Table, "name", "pug"));
+    var apple = getSV(getSV(parsed.Table, "fruit").?.Table, "apple").?.Table;
+    expect(checkS(apple, "color", "red"));
+    expect(getSV(getSV(apple, "taste").?.Table, "sweet").?.Bool);
 }
 
 test "examples-invalid" {
@@ -2088,6 +2136,17 @@ test "examples-invalid" {
         \\# You can't turn an integer into a table.
         \\fruit.apple.smooth = true
         ,
+        \\[fruit]
+        \\apple = "red"
+        \\
+        \\[fruit]
+        \\orange = "orange"
+        ,
+        \\[fruit]
+        \\apple = "red"
+        \\
+        \\[fruit.apple]
+        \\texture = "smooth"
     };
     for (invalids) |invalid| {
         if (parser.parse(Value, invalid)) |parsed| {
