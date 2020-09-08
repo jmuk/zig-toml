@@ -1954,6 +1954,49 @@ test "exapmle8" {
     expect(checkS(parsed.Table, "str11", "'That's still pointless', she said."));
 }
 
+test "example9" {
+    var tester = testing.LeakCountAllocator.init(std.heap.page_allocator);
+    defer tester.validate() catch {};
+    var allocator = &tester.allocator;
+    var parser = try Parser.init(allocator);
+    defer allocator.destroy(parser);
+
+    var parsed = try parser.parse(Value,
+        \\int1 = +99
+        \\int2 = 42
+        \\int3 = 0
+        \\int4 = -17
+        \\int5 = 1_000
+        \\int6 = 5_349_221
+        \\int7 = 1_2_3_4_5     # VALID but discouraged 
+        \\# hexadecimal with prefix `0x`
+        \\hex1 = 0xDEADBEEF
+        \\hex2 = 0xdeadbeef
+        \\hex3 = 0xdead_beef
+        \\
+        \\# octal with prefix `0o`
+        \\oct1 = 0o01234567
+        \\oct2 = 0o755 # useful for Unix file permissions
+        \\
+        \\# binary with prefix `0b`
+        \\bin1 = 0b11010110
+    );
+    defer parsed.deinit();
+    expect(getS(parsed.Table, "int1").?.value.Int == 99);
+    expect(getS(parsed.Table, "int2").?.value.Int == 42);
+    expect(getS(parsed.Table, "int3").?.value.Int == 0);
+    expect(getS(parsed.Table, "int4").?.value.Int == -17);
+    expect(getS(parsed.Table, "int5").?.value.Int == 1000);
+    expect(getS(parsed.Table, "int6").?.value.Int == 5349221);
+    expect(getS(parsed.Table, "int7").?.value.Int == 12345);
+    expect(getS(parsed.Table, "hex1").?.value.Int == 0xdeadbeef);
+    expect(getS(parsed.Table, "hex2").?.value.Int == 0xdeadbeef);
+    expect(getS(parsed.Table, "hex3").?.value.Int == 0xdeadbeef);
+    expect(getS(parsed.Table, "oct1").?.value.Int == 0o01234567);
+    expect(getS(parsed.Table, "oct2").?.value.Int == 0o755);
+    expect(getS(parsed.Table, "bin1").?.value.Int == 0b11010110);
+}
+
 test "examples-invalid" {
     var tester = testing.LeakCountAllocator.init(std.heap.page_allocator);
     defer tester.validate() catch {};
