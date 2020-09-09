@@ -117,8 +117,12 @@ pub const ParseError = error {
 const VisitType = enum {
     // Not visited
     None,
+
     // Unable to extend through bracket
     CantExtend,
+
+    // Unable to extend through both bracket and keyvalue
+    CantExtendKeyvalue,
 
     // Can extend by bracket
     Extendable,
@@ -760,7 +764,7 @@ pub const Parser = struct {
                 if (v.* != .Table) {
                     return ParseError.IncorrectDataType;
                 }
-                try visited.markVisited(key, .CantExtend);
+                try visited.markVisited(key, .CantExtendKeyvalue);
                 var nv = Value{.Bool = false};
                 var offset = try self.parseValue(input, offset_in, visited, Value, &nv);
                 _ = try v.*.Table.put(key, nv);
@@ -772,7 +776,7 @@ pub const Parser = struct {
                     return ParseError.IncorrectDataType;
                 inline for (ti.Struct.fields) |field| {
                     if (mem.eql(u8, key.items, field.name)) {
-                        try visited.markVisited(key, .CantExtend);
+                        try visited.markVisited(key, .CantExtendKeyvalue);
                         return self.parseValue(input, offset_in, visited, field.field_type, &(@field(v, field.name)));
                     }
                 }
@@ -781,6 +785,10 @@ pub const Parser = struct {
         }
         var newvtype = if (keys.len > 2) VisitType.Extendable else VisitType.CantExtend;
         var vtype = visited.visitedType(key);
+        if (vtype == .CantExtendKeyvalue) {
+            key.deinit();
+            return ParseError.DuplicatedKey;
+        }
         if (T == Value) {
             if (v.* == .Table) {
                 var gpr = try v.*.Table.getOrPut(key);
@@ -793,7 +801,7 @@ pub const Parser = struct {
                 } else {
                     gpr.kv.value = Value{.Table = Table.init(self.allocator)};
                 }
-                if (vtype == .None or (vtype == .CantExtend and newvtype == .Extendable))
+                if (vtype == .None or newvtype == .Extendable)
                     try visited.markVisited(key, newvtype);
                 return self.lookupAndParseValue(
                     input, offset_in, keys[1..(keys.len)], visited.getChild(key).?,
@@ -822,7 +830,7 @@ pub const Parser = struct {
                     @field(v, field.name) = f;
                     return offset;
                 }
-                if (vtype == .None or (vtype == .CantExtend and newvtype == .Extendable))
+                if (vtype == .None or newvtype == .Extendable)
                     try visited.markVisited(key, newvtype);
                 return self.lookupAndParseValue(
                     input, offset_in, keys[1..(keys.len)], visited.getChild(key).?,
@@ -834,12 +842,8 @@ pub const Parser = struct {
 
     fn parseAssign(self: *Parser, input: []const u8, offset_in: usize, visited: *VisitedNode, comptime T: type, data: *T) !usize {
         var keys = try self.parseKey(input, offset_in);
-        defer keys.keys.deinit();
-        defer for (keys.keys.items) |k| {
-            k.deinit();
-        };
+        defer keys.deinit();
         if (input[keys.offset] != '=') {
-            keys.deinit();
             return ParseError.FailedToParse;
         }
         return self.lookupAndParseValue(input, keys.offset+1, keys.keys.items, visited, T, data);
@@ -857,7 +861,7 @@ pub const Parser = struct {
         try key.appendSlice(keys[0].items);
         var vtype = visited.visitedType(key);
         if (keys.len == 1) {
-            if (vtype == .CantExtend) {
+            if (vtype == .CantExtend or vtype == .CantExtendKeyvalue) {
                 key.deinit();
                 return ParseError.DuplicatedKey;
             }
@@ -901,7 +905,6 @@ pub const Parser = struct {
                     return offset;
                 }
                 gpr.kv.value = Value{.Table = Table.init(self.allocator)};
-                errdefer gpr.kv.value.deinit();
                 return self.parseKVs(
                     input, offset_in, visited.getChild(key).?, Value, &gpr.kv.value);
             }
@@ -953,7 +956,7 @@ pub const Parser = struct {
             return ParseError.IncorrectDataType;
         }
 
-        if (vtype == .CantExtend)
+        if (vtype == .CantExtend or vtype == .CantExtendKeyvalue)
             return ParseError.DuplicatedKey;
 
         if (T == Value) {
@@ -977,7 +980,6 @@ pub const Parser = struct {
             }
             try visited.markVisited(key, .Extendable);
             gpr.kv.value = Value{.Table = Table.init(self.allocator)};
-            errdefer gpr.kv.value.deinit();
             return self.lookupAndParseKVs(
                 input, offset_in, keys[1..(keys.len)], is_array,
                 visited.getChild(key).?,
@@ -1037,16 +1039,11 @@ pub const Parser = struct {
             count = 2;
         }
         var keys = try self.parseKey(input, offset+count);
-        defer keys.keys.deinit();
-        defer for (keys.keys.items) |k| {
-            k.deinit();
-        };
+        defer keys.deinit();
         var i: usize = 0;
         while (i < count) : (i += 1) {
-            if (input[keys.offset+i] != ']') {
-                keys.keys.deinit();
+            if (input[keys.offset+i] != ']')
                 return ParseError.FailedToParse;
-            }
         }
         offset = keys.offset+count;
         var has_linebreak = false;
@@ -2149,6 +2146,26 @@ test "example11" {
     expect(apple.get("taste").?.get("sweet").?.Bool);
 }
 
+test "example12" {
+    var tester = testing.LeakCountAllocator.init(std.heap.page_allocator);
+    defer tester.validate() catch {};
+    var allocator = &tester.allocator;
+    var parser = try Parser.init(allocator);
+    defer allocator.destroy(parser);
+
+    var parsed = try parser.parse(Value,
+        \\name = { first = "Tom", last = "Preston-Werner" }
+        \\point = { x = 1, y = 2 }
+        \\animal = { type.name = "pug" }
+    );
+    defer parsed.deinit();
+    expect(checkS(parsed.get("name").?, "first", "Tom"));
+    expect(checkS(parsed.get("name").?, "last", "Preston-Werner"));
+    expect(parsed.get("point").?.get("x").?.Int == 1);
+    expect(parsed.get("point").?.get("y").?.Int == 2);
+    expect(checkS(parsed.get("animal").?.get("type").?, "name", "pug"));
+}
+
 test "examples-invalid" {
     var tester = testing.LeakCountAllocator.init(std.heap.page_allocator);
     defer tester.validate() catch {};
@@ -2194,6 +2211,50 @@ test "examples-invalid" {
         \\apple.taste.sweet = true
         \\[fruit.apple.taste]  # INVALID
         \\test = true
+        ,
+        \\[product]
+        \\type = { name = "Nail" }
+        \\type.edible = false  # INVALID
+        ,
+        \\[product]
+        \\type.name = "Nail"
+        \\type = { edible = false }  # INVALID
+        ,
+        \\[fruit.physical]  # subtable, but to which parent element should it belong?
+        \\  color = "red"
+        \\  shape = "round"
+        \\
+        \\[[fruit]]
+        \\  name = "apple"
+        ,
+        \\fruit = []
+        \\
+        \\[[fruit]] # Not allowed
+        \\foo = "bar"
+        ,
+        \\[[fruit]]
+        \\  name = "apple"
+        \\
+        \\  [[fruit.variety]]
+        \\    name = "red delicious"
+        \\
+        \\  # INVALID: This table conflicts with the previous array of tables
+        \\  [fruit.variety]
+        \\    name = "granny smith"
+        ,
+        \\[[fruit]]
+        \\  name = "apple"
+        \\
+        \\  [[fruit.variety]]
+        \\    name = "red delicious"
+        \\
+        \\  [fruit.physical]
+        \\    color = "red"
+        \\    shape = "round"
+        \\
+        \\  # INVALID: This array of tables conflicts with the previous table
+        \\  [[fruit.physical]]
+        \\    color = "green"
     };
     for (invalids) |invalid| {
         if (parser.parse(Value, invalid)) |parsed| {
