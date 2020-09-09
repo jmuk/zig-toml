@@ -724,11 +724,14 @@ pub const Parser = struct {
                 ;
                 var a = std.ArrayList(ptr.child).init(allocator);
                 errdefer a.deinit();
-                offset = try if (ptr.child == u8)
-                    self.parseString(input, offset, &a)
-                else
-                    self.parseArray(input, offset, visited, ptr.child, &a)
-                ;
+                if (ptr.child == u8) {
+                    offset = try if (input[offset] == '[')
+                        self.parseArray(input, offset, visited, ptr.child, &a)
+                    else
+                        self.parseString(input, offset, &a);
+                } else {
+                    offset = try self.parseArray(input, offset, visited, ptr.child, &a);
+                }
                 v.* = a.items;
                 return offset;
             },
@@ -1531,7 +1534,7 @@ test "parseInt" {
     expect(n == 161);
 
     // invalid octal.
-    if (parser.parseInt("0o9", 0, i64, &n) catch |err| e: {
+    expect(parser.parseInt("0o9", 0, i64, &n) catch |err| e: {
         expect(err == ParseError.FailedToParse);
         break :e 0;
     } == 0);
