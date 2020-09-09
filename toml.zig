@@ -273,7 +273,7 @@ pub const Parser = struct {
         return self.parseTrue(input, offset, value) catch self.parseFalse(input, offset, value);
     }
 
-    fn parseInt(self: *Parser, input: []const u8, offset: usize, value: *i64) !usize {
+    fn parseInt(self: *Parser, input: []const u8, offset: usize, comptime T: type, value: *T) !usize {
         var i = offset;
         var start = offset;
         var initial = true;
@@ -281,6 +281,9 @@ pub const Parser = struct {
         var base: u8 = 10;
         while (i < input.len) : (i+=1) {
             if (initial and (input[i] == '+' or input[i] == '-')) {
+                // Negative value is set for unsigned types.
+                if (!@typeInfo(T).Int.is_signed and input[i] == '-')
+                    return ParseError.IncorrectDataType;
                 initial = false;
                 continue;
             }
@@ -340,7 +343,7 @@ pub const Parser = struct {
         } else {
             buf = input[start..i];
         }
-        value.* = try fmt.parseInt(i64, buf, base);
+        value.* = try fmt.parseInt(T, buf, base);
         return i;
     }
 
@@ -357,17 +360,17 @@ pub const Parser = struct {
         return null;
     }
 
-    fn parseFloat(self: *Parser, input: []const u8, offset: usize, value: *f64) !usize {
+    fn parseFloat(self: *Parser, input: []const u8, offset: usize, comptime T: type, value: *T) !usize {
         if (self.checkSignedPattern(input, offset, "inf")) |out| {
             if (input[offset] == '-') {
-                value.* = -std.math.inf(f64);
+                value.* = -std.math.inf(T);
             } else {
-                value.* = std.math.inf(f64);
+                value.* = std.math.inf(T);
             }
             return out;
         }
         if (self.checkSignedPattern(input, offset, "nan")) |out| {
-            value.* = std.math.nan(f64);
+            value.* = std.math.nan(T);
             return out;
         }
         var i = offset;
@@ -407,7 +410,7 @@ pub const Parser = struct {
         if (!has_dot and !has_e) {
             return ParseError.FailedToParse;
         }
-        value.* = try fmt.parseFloat(f64, input[offset..i]);
+        value.* = try fmt.parseFloat(T, input[offset..i]);
         return i;
     }
 
@@ -687,12 +690,12 @@ pub const Parser = struct {
                 return self.parseInlineTable(input, offset, visited, Value, v);
             }
             var f: f64 = 0.0;
-            if (self.parseFloat(input, offset, &f)) |offset_out| {
+            if (self.parseFloat(input, offset, f64, &f)) |offset_out| {
                 v.* = Value{.Float = f};
                 return offset_out;
             } else |err| {
                 var i: i64 = 0;
-                offset = try self.parseInt(input, offset, &i);
+                offset = try self.parseInt(input, offset, i64, &i);
                 v.* = Value{.Int = i};
                 return offset;
             }
@@ -706,8 +709,8 @@ pub const Parser = struct {
         }
         switch (@typeInfo(T)) {
             .Bool => return self.parseBool(input, offset, v),
-            .Int => return self.parseInt(input, offset, v),
-            .Float => return self.parseFloat(input, offset, v),
+            .Int => return self.parseInt(input, offset, T, v),
+            .Float => return self.parseFloat(input, offset, T, v),
             .Pointer => |ptr| {
                 if (ptr.size == .One) {
                     v.* = try self.allocator.create(ptr.child);
@@ -1502,57 +1505,57 @@ test "parseInt" {
     defer allocator.destroy(parser);
 
     var n: i64 = 0;
-    expect((try parser.parseInt("123", 0, &n)) == 3);
+    expect((try parser.parseInt("123", 0, i64, &n)) == 3);
     expect(n == 123);
 
-    expect((try parser.parseInt("-123", 0, &n)) == 4);
+    expect((try parser.parseInt("-123", 0, i64, &n)) == 4);
     expect(n == -123);
 
-    expect((try parser.parseInt("+123_456_789", 0, &n)) == 12);
+    expect((try parser.parseInt("+123_456_789", 0, i64, &n)) == 12);
     expect(n == 123456789);
 
-    expect((try parser.parseInt("0XFF", 0, &n)) == 4);
+    expect((try parser.parseInt("0XFF", 0, i64, &n)) == 4);
     expect(n == 255);
 
-    expect((try parser.parseInt("0Xa", 0, &n)) == 3);
+    expect((try parser.parseInt("0Xa", 0, i64, &n)) == 3);
     expect(n == 10);
 
-    expect((try parser.parseInt("0o20", 0, &n)) == 4);
+    expect((try parser.parseInt("0o20", 0, i64, &n)) == 4);
     expect(n == 16);
 
-    expect((try parser.parseInt("0b0100", 0, &n)) == 6);
+    expect((try parser.parseInt("0b0100", 0, i64, &n)) == 6);
     expect(n == 4);
 
     // hexadecimal with underscore.
-    expect((try parser.parseInt("0xa_1", 0, &n)) == 5);
+    expect((try parser.parseInt("0xa_1", 0, i64, &n)) == 5);
     expect(n == 161);
 
     // invalid octal.
-    expect(parser.parseInt("0o9", 0, &n) catch |err| e: {
+    if (parser.parseInt("0o9", 0, i64, &n) catch |err| e: {
         expect(err == ParseError.FailedToParse);
         break :e 0;
     } == 0);
 
     // invalid binary.
-    expect(parser.parseInt("0b2", 0, &n) catch |err| e: {
+    expect(parser.parseInt("0b2", 0, i64, &n) catch |err| e: {
         expect(err == ParseError.FailedToParse);
         break :e 0;
     } == 0);
 
     // invalid hexadecimal.
-    expect(parser.parseInt("0xQ", 0, &n) catch |err| e: {
+    expect(parser.parseInt("0xQ", 0, i64, &n) catch |err| e: {
         expect(err == ParseError.FailedToParse);
         break :e 0;
     } == 0);
 
     // invalid prefix.
-    expect(parser.parseInt("0q0", 0, &n) catch |err| e: {
+    expect(parser.parseInt("0q0", 0, i64, &n) catch |err| e: {
         expect(err == ParseError.FailedToParse);
         break :e 0;
     } == 0);
 
     // signs can't be combined with prefix.
-    expect(parser.parseInt("+0xdeadbeef", 0, &n) catch |err| e: {
+    expect(parser.parseInt("+0xdeadbeef", 0, i64, &n) catch |err| e: {
         expect(err == ParseError.FailedToParse);
         break :e 0;
     } == 0);
@@ -1565,23 +1568,26 @@ test "parseFloat" {
     var parser = try Parser.init(allocator);
     defer allocator.destroy(parser);
 
-    var f: f64 = 0.0;
-    expect((try parser.parseFloat("1.5", 0, &f)) == 3);
-    expect(f == 1.5);
-    expect((try parser.parseFloat("-1e2", 0, &f)) == 4);
-    expect(f == -1e2);
-    expect((try parser.parseFloat(".2e-1", 0, &f)) == 5);
-    expect(f == 0.2e-1);
-    expect((try parser.parseFloat("1.e+2", 0, &f)) == 5);
-    expect(f == 1e+2);
-    expect((try parser.parseFloat("inf", 0, &f)) == 3);
-    expect(f == std.math.inf(f64));
-    expect((try parser.parseFloat("-inf", 0, &f)) == 4);
-    expect(f == -std.math.inf(f64));
-    expect((try parser.parseFloat("nan", 0, &f)) == 3);
-    expect(std.math.isNan(f));
-    expect((try parser.parseFloat("+nan", 0, &f)) == 4);
-    expect(std.math.isNan(f));
+    comptime var types = [2]type{f64, f32};
+    inline for (types) |t| {
+        var f: t = 0.0;
+        expect((try parser.parseFloat("1.5", 0, t, &f)) == 3);
+        expect(f == 1.5);
+        expect((try parser.parseFloat("-1e2", 0, t, &f)) == 4);
+        expect(f == -1e2);
+        expect((try parser.parseFloat(".2e-1", 0, t, &f)) == 5);
+        expect(f == 0.2e-1);
+        expect((try parser.parseFloat("1.e+2", 0, t, &f)) == 5);
+        expect(f == 1e+2);
+        expect((try parser.parseFloat("inf", 0, t, &f)) == 3);
+        expect(f == std.math.inf(t));
+        expect((try parser.parseFloat("-inf", 0, t, &f)) == 4);
+        expect(f == -std.math.inf(t));
+        expect((try parser.parseFloat("nan", 0, t, &f)) == 3);
+        expect(std.math.isNan(f));
+        expect((try parser.parseFloat("+nan", 0, t, &f)) == 4);
+        expect(std.math.isNan(f));
+    }
 }
 
 test "parseString" {
