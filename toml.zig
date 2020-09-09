@@ -21,24 +21,6 @@ fn hashKey(a: Key) u32 {
     return std.hash_map.hashString(a.items);
 }
 
-// getS is a utility to look up in a table with a string literal.
-pub fn getS(tbl: Table, key: []const u8) ?*Table.KV {
-    var a = Key.init(tbl.allocator);
-    defer a.deinit();
-    if (a.appendSlice(key)) |_| {
-        return tbl.get(a);
-    } else |err| {
-        return null;
-    }
-}
-
-pub fn getSV(tbl: Table, key: []const u8) ?Value {
-    if (getS(tbl, key)) |kv| {
-        return kv.value;
-    }
-    return null;
-}
-
 pub const ValueTag = enum {
     String, Int, Float, Bool, Table, Array,
 };
@@ -71,6 +53,42 @@ pub const Value = union(ValueTag) {
                 objs.deinit();
             },
             else => {},
+        }
+    }
+
+    pub fn get(self: Value, key: []const u8) ?Value {
+        if (self != .Table)
+            return null;
+        var a = Key.init(self.Table.allocator);
+        defer a.deinit();
+        if (a.appendSlice(key)) |_| {
+            if (self.Table.get(a)) |kv| {
+                return kv.value;
+            } else {
+                return null;
+            }
+        } else |err| {
+            return null;
+        }
+    }
+
+    pub fn idx(self: Value, i: usize) ?Value {
+        if (self != .Array)
+            return null;
+        if (i >= self.Array.items.len)
+            return null;
+        return self.Array.items[i];
+    }
+
+    // size returns the number of children in the value.
+    // If self is a string, it returns the string length.
+    // It returns 0 for other leaf values.
+    pub fn size(self: Value) usize {
+        switch (self) {
+            .Table => |tbl| return tbl.size,
+            .Array => |arr| return arr.items.len,
+            .String => |str| return str.items.len,
+            else => return 0,
         }
     }
 };
@@ -1100,12 +1118,12 @@ pub const Parser = struct {
 };
 
 // helper for tests.
-fn checkS(tbl: Table, key: []const u8, e: []const u8) bool {
-    if (getS(tbl, key)) |kv| {
-        if (kv.value == .String) {
-            return mem.eql(u8, kv.value.String.items, e);
+fn checkS(v: Value, key: []const u8, e: []const u8) bool {
+    if (v.get(key)) |r| {
+        if (r == .String) {
+            return mem.eql(u8, r.String.items, e);
         } else {
-            std.debug.warn("value {} is not a string\n", .{kv.value});
+            std.debug.warn("value {} is not a string\n", .{r});
         }
     } else {
         std.debug.warn("key {} not found\n", .{key});
@@ -1132,8 +1150,8 @@ test "simple-kv" {
     var parsed = try parser.parse(Value, " \t foo\t=  42 # comment1  \nbar= \t42.");
     defer parsed.deinit();
     expect(parsed.Table.size == 2);
-    expect(getS(parsed.Table, "foo").?.value.Int == 42);
-    expect(getS(parsed.Table, "bar").?.value.Float == 42);
+    expect(parsed.get("foo").?.Int == 42);
+    expect(parsed.get("bar").?.Float == 42.0);
 }
 
 test "simple-struct" {
@@ -1159,8 +1177,8 @@ test "string-kv" {
     defer allocator.destroy(parser);
     var parsed = try parser.parse(Value, "#test\n \t foo\t=  \"bar\"   \n");
     defer parsed.deinit();
-    expect(parsed.Table.size == 1);
-    expect(checkS(parsed.Table, "foo", "bar"));
+    expect(parsed.size() == 1);
+    expect(checkS(parsed, "foo", "bar"));
 }
 
 test "string-struct" {
@@ -1186,14 +1204,14 @@ test "bracket-kv" {
     defer allocator.destroy(parser);
     var parsed = try parser.parse(Value, "[foo]\nbar=42\nbaz=true\n[quox]\nbar=96\n");
     defer parsed.deinit();
-    expect(parsed.Table.size == 2);
-    var o1 = getS(parsed.Table, "foo").?.value.Table;
-    expect(o1.size == 2);
-    expect(getS(o1, "bar").?.value.Int == 42);
-    expect(getS(o1, "baz").?.value.Bool);
-    var o2 = getS(parsed.Table, "quox").?.value.Table;
-    expect(o2.size == 1);
-    expect(getS(o2, "bar").?.value.Int == 96);
+    expect(parsed.size() == 2);
+    var o1 = parsed.get("foo").?;
+    expect(o1.size() == 2);
+    expect(o1.get("bar").?.Int == 42);
+    expect(o1.get("baz").?.Bool);
+    var o2 = parsed.get("quox").?;
+    expect(o2.size() == 1);
+    expect(o2.get("bar").?.Int == 96);
 }
 
 test "bracket-struct" {
@@ -1228,16 +1246,16 @@ test "double-bracket" {
     defer allocator.destroy(parser);
     var parsed = try parser.parse(Value, "[[foo]]\nbar=42\nbaz=true\n[[foo]]\nbar=96\n");
     defer parsed.deinit();
-    expect(parsed.Table.size == 1);
-    var a = getS(parsed.Table, "foo").?.value.Array;
-    expect(a.items.len == 2);
-    var o1 = a.items[0].Table;
-    expect(o1.size == 2);
-    expect(getS(o1, "bar").?.value.Int == 42);
-    expect(getS(o1, "baz").?.value.Bool);
-    var o2 = a.items[1].Table;
-    expect(o2.size == 1);
-    expect(getS(o2, "bar").?.value.Int == 96);
+    expect(parsed.size() == 1);
+    var a = parsed.get("foo").?;
+    expect(a.size() == 2);
+    var o1 = a.idx(0).?;
+    expect(o1.size() == 2);
+    expect(o1.get("bar").?.Int == 42);
+    expect(o1.get("baz").?.Bool);
+    var o2 = a.idx(1).?;
+    expect(o2.size() == 1);
+    expect(o2.get("bar").?.Int == 96);
 }
 
 const subtable_text =
@@ -1267,26 +1285,26 @@ test "double-bracket-subtable" {
     var parsed = try parser.parse(Value, subtable_text);
     defer parsed.deinit();
 
-    expect(parsed.Table.size == 1);
-    var fruits = getS(parsed.Table, "fruit").?.value.Array;
-    expect(fruits.items.len == 2);
-    var apple = fruits.items[0].Table;
-    expect(apple.size == 3);
+    expect(parsed.size() == 1);
+    var fruits = parsed.get("fruit").?;
+    expect(fruits.size() == 2);
+    var apple = fruits.idx(0).?;
+    expect(apple.size() == 3);
     expect(checkS(apple, "name", "apple"));
-    var physical = getS(apple, "physical").?.value.Table;
+    var physical = apple.get("physical").?;
     expect(checkS(physical, "color", "red"));
     expect(checkS(physical, "shape", "round"));
-    var varieties = getS(apple, "variety").?.value.Array;
-    expect(varieties.items.len == 2);
-    expect(checkS(varieties.items[0].Table, "name", "red delicious"));
-    expect(checkS(varieties.items[1].Table, "name", "granny smith"));
+    var varieties = apple.get("variety").?;
+    expect(varieties.size() == 2);
+    expect(checkS(varieties.idx(0).?, "name", "red delicious"));
+    expect(checkS(varieties.idx(1).?, "name", "granny smith"));
 
-    var banana = fruits.items[1].Table;
-    expect(banana.size == 2);
+    var banana = fruits.idx(1).?;
+    expect(banana.size() == 2);
     expect(checkS(banana, "name", "banana"));
-    varieties = getS(banana, "variety").?.value.Array;
-    expect(varieties.items.len == 1);
-    expect(checkS(varieties.items[0].Table, "name", "plantain"));
+    varieties = banana.get("variety").?;
+    expect(varieties.size() == 1);
+    expect(checkS(varieties.idx(0).?, "name", "plantain"));
 }
 
 const fruit_physical = struct {
@@ -1402,35 +1420,35 @@ test "example" {
     var parsed = try parser.parse(Value, example_data);
     defer parsed.deinit();
 
-    expect(parsed.Table.size == 4);
-    expect(checkS(parsed.Table, "title", "TOML Example"));
-    var owner = getS(parsed.Table, "owner").?.value.Table;
-    expect(owner.size == 1);
+    expect(parsed.size() == 4);
+    expect(checkS(parsed, "title", "TOML Example"));
+    var owner = parsed.get("owner").?;
+    expect(owner.size() == 1);
     expect(checkS(owner, "name", "Tom Preston-Werner"));
 
-    var database = getS(parsed.Table, "database").?.value.Table;
-    expect(getS(database, "enabled").?.value.Bool);
-    var ports = getS(database, "ports").?.value.Array;
-    expect(ports.items.len == 3);
-    expect(ports.items[0].Int == 8001);
-    expect(ports.items[1].Int == 8001);
-    expect(ports.items[2].Int == 8002);
-    var data = getS(database, "data").?.value.Array;
-    expect(data.items.len == 2);
-    expect(mem.eql(u8, data.items[0].Array.items[0].String.items, "delta"));
-    expect(mem.eql(u8, data.items[0].Array.items[1].String.items, "phi"));
-    expect(data.items[1].Array.items[0].Float == 3.14);
-    var temp_targets = getS(database, "temp_targets").?.value.Table;
-    expect(temp_targets.size == 2);
-    expect(getS(temp_targets, "cpu").?.value.Float == 79.5);
-    expect(getS(temp_targets, "case").?.value.Float == 72.0);
+    var database = parsed.get("database").?;
+    expect(database.get("enabled").?.Bool);
+    var ports = database.get("ports").?;
+    expect(ports.size() == 3);
+    expect(ports.idx(0).?.Int == 8001);
+    expect(ports.idx(1).?.Int == 8001);
+    expect(ports.idx(2).?.Int == 8002);
+    var data = database.get("data").?;
+    expect(data.size() == 2);
+    expect(mem.eql(u8, data.idx(0).?.idx(0).?.String.items, "delta"));
+    expect(mem.eql(u8, data.idx(0).?.idx(1).?.String.items, "phi"));
+    expect(data.idx(1).?.idx(0).?.Float == 3.14);
+    var temp_targets = database.get("temp_targets").?;
+    expect(temp_targets.size() == 2);
+    expect(temp_targets.get("cpu").?.Float == 79.5);
+    expect(temp_targets.get("case").?.Float == 72.0);
 
-    var servers = getS(parsed.Table, "servers").?.value.Table;
-    expect(servers.size == 2);
-    var alpha = getS(servers, "alpha").?.value.Table;
+    var servers = parsed.get("servers").?;
+    expect(servers.size() == 2);
+    var alpha = servers.get("alpha").?;
     expect(checkS(alpha, "ip", "10.0.0.1"));
     expect(checkS(alpha, "role", "frontend"));
-    var beta = getS(servers, "beta").?.value.Table;
+    var beta = servers.get("beta").?;
     expect(checkS(beta, "ip", "10.0.0.2"));
     expect(checkS(beta, "role", "backend"));
 }
@@ -1689,9 +1707,9 @@ test "parseInlineTable" {
     defer v.deinit();
     expect((try parser.parseInlineTable("{ x = 1, y = 2 }",
         0, &v, Value, &t)) == 16);
-    expect(t.Table.size == 2);
-    expect(getS(t.Table, "x").?.value.Int == 1);
-    expect(getS(t.Table, "y").?.value.Int == 2);
+    expect(t.size() == 2);
+    expect(t.get("x").?.Int == 1);
+    expect(t.get("y").?.Int == 2);
 }
 
 // examples are from https://toml.io/en/v1.0.0-rc.1.
@@ -1708,8 +1726,8 @@ test "examples1" {
         \\another = "# This is not a comment"
     );
     defer parsed.deinit();
-    expect(checkS(parsed.Table, "key", "value"));
-    expect(checkS(parsed.Table, "another", "# This is not a comment"));
+    expect(checkS(parsed, "key", "value"));
+    expect(checkS(parsed, "another", "# This is not a comment"));
 }
 
 test "examples2" {
@@ -1731,15 +1749,15 @@ test "examples2" {
         \\'quoted "value"' = "value"
     );
     defer parsed.deinit();
-    expect(checkS(parsed.Table, "key", "value"));
-    expect(checkS(parsed.Table, "bare_key", "value"));
-    expect(checkS(parsed.Table, "bare-key", "value"));
-    expect(checkS(parsed.Table, "1234", "value"));
-    expect(checkS(parsed.Table, "127.0.0.1", "value"));
-    expect(checkS(parsed.Table, "character encoding", "value"));
-    expect(checkS(parsed.Table, "ʎǝʞ", "value"));
-    expect(checkS(parsed.Table, "key2", "value"));
-    expect(checkS(parsed.Table, "quoted \"value\"", "value"));
+    expect(checkS(parsed, "key", "value"));
+    expect(checkS(parsed, "bare_key", "value"));
+    expect(checkS(parsed, "bare-key", "value"));
+    expect(checkS(parsed, "1234", "value"));
+    expect(checkS(parsed, "127.0.0.1", "value"));
+    expect(checkS(parsed, "character encoding", "value"));
+    expect(checkS(parsed, "ʎǝʞ", "value"));
+    expect(checkS(parsed, "key2", "value"));
+    expect(checkS(parsed, "quoted \"value\"", "value"));
 }
 
 test "example3" {
@@ -1753,7 +1771,7 @@ test "example3" {
         \\"" = "blank"     # VALID but discouraged
     );
     defer parsed.deinit();
-    expect(checkS(parsed.Table, "", "blank"));
+    expect(checkS(parsed, "", "blank"));
 }
 
 test "example4" {
@@ -1770,10 +1788,10 @@ test "example4" {
         \\site."google.com" = true
     );
     defer parsed.deinit();
-    expect(checkS(parsed.Table, "name", "Orange"));
-    expect(checkS(getS(parsed.Table, "physical").?.value.Table, "color", "orange"));
-    expect(checkS(getS(parsed.Table, "physical").?.value.Table, "shape", "round"));
-    expect(getS(getS(parsed.Table, "site").?.value.Table, "google.com").?.value.Bool);
+    expect(checkS(parsed, "name", "Orange"));
+    expect(checkS(parsed.get("physical").?, "color", "orange"));
+    expect(checkS(parsed.get("physical").?, "shape", "round"));
+    expect(parsed.get("site").?.get("google.com").?.Bool);
 }
 
 test "example5" {
@@ -1785,7 +1803,7 @@ test "example5" {
 
     var parsed = try parser.parse(Value, "3.14159 = \"pi\"");
     defer parsed.deinit();
-    expect(checkS(getS(parsed.Table, "3").?.value.Table, "14159", "pi"));
+    expect(checkS(parsed.get("3").?, "14159", "pi"));
 }
 
 test "example6" {
@@ -1803,8 +1821,8 @@ test "example6" {
         \\fruit.orange = 2
     );
     defer parsed.deinit();
-    expect(getS(getS(getS(parsed.Table, "fruit").?.value.Table, "apple").?.value.Table, "smooth").?.value.Bool);
-    expect(getS(getS(parsed.Table, "fruit").?.value.Table, "orange").?.value.Int == 2);
+    expect(parsed.get("fruit").?.get("apple").?.get("smooth").?.Bool);
+    expect(parsed.get("fruit").?.get("orange").?.Int == 2);
 }
 
 fn deepEqual(v1: Value, v2: Value) bool {
@@ -1933,32 +1951,32 @@ test "exapmle8" {
     );
     defer parsed.deinit();
 
-    expect(checkS(parsed.Table, "str", "I'm a string. \"You can quote me\". Name\tJos\xC3\xA9\nLocation\tSF."));
-    expect(checkS(parsed.Table, "str1", "Roses are red\nViolets are blue"));
-    expect(checkS(parsed.Table, "str2", "Roses are red\nViolets are blue"));
-    expect(checkS(parsed.Table, "str3", "Roses are red\r\nViolets are blue"));
-    expect(checkS(parsed.Table, "str4", "The quick brown fox jumps over the lazy dog."));
-    expect(checkS(parsed.Table, "str5", "The quick brown fox jumps over the lazy dog."));
-    expect(checkS(parsed.Table, "str6", "The quick brown fox jumps over the lazy dog."));
-    expect(checkS(parsed.Table, "str7", "Here are two quotation marks: \"\". Simple enough."));
-    expect(checkS(parsed.Table, "str8", "Here are three quotation marks: \"\"\"."));
-    expect(checkS(parsed.Table, "str9", "Here are fifteen quotation marks: \"\"\"\"\"\"\"\"\"\"\"\"\"\"\"."));
-    expect(checkS(parsed.Table, "str10", "\"This,\" she said, \"is just a pointless statement.\""));
-    expect(checkS(parsed.Table, "winpath", "C:\\Users\\nodejs\\templates"));
-    expect(checkS(parsed.Table, "winpath2", "\\\\ServerX\\admin$\\system32\\"));
-    expect(checkS(parsed.Table, "quoted", "Tom \"Dubs\" Preston-Werner"));
-    expect(checkS(parsed.Table, "regex", "<\\i\\c*\\s*>"));
-    expect(checkS(parsed.Table, "regex2", "I [dw]on't need \\d{2} apples"));
-    expect(checkS(parsed.Table, "lines",
+    expect(checkS(parsed, "str", "I'm a string. \"You can quote me\". Name\tJos\xC3\xA9\nLocation\tSF."));
+    expect(checkS(parsed, "str1", "Roses are red\nViolets are blue"));
+    expect(checkS(parsed, "str2", "Roses are red\nViolets are blue"));
+    expect(checkS(parsed, "str3", "Roses are red\r\nViolets are blue"));
+    expect(checkS(parsed, "str4", "The quick brown fox jumps over the lazy dog."));
+    expect(checkS(parsed, "str5", "The quick brown fox jumps over the lazy dog."));
+    expect(checkS(parsed, "str6", "The quick brown fox jumps over the lazy dog."));
+    expect(checkS(parsed, "str7", "Here are two quotation marks: \"\". Simple enough."));
+    expect(checkS(parsed, "str8", "Here are three quotation marks: \"\"\"."));
+    expect(checkS(parsed, "str9", "Here are fifteen quotation marks: \"\"\"\"\"\"\"\"\"\"\"\"\"\"\"."));
+    expect(checkS(parsed, "str10", "\"This,\" she said, \"is just a pointless statement.\""));
+    expect(checkS(parsed, "winpath", "C:\\Users\\nodejs\\templates"));
+    expect(checkS(parsed, "winpath2", "\\\\ServerX\\admin$\\system32\\"));
+    expect(checkS(parsed, "quoted", "Tom \"Dubs\" Preston-Werner"));
+    expect(checkS(parsed, "regex", "<\\i\\c*\\s*>"));
+    expect(checkS(parsed, "regex2", "I [dw]on't need \\d{2} apples"));
+    expect(checkS(parsed, "lines",
         \\The first newline is
         \\trimmed in raw strings.
         \\   All other whitespace
         \\   is preserved.
         \\
     ));
-    expect(checkS(parsed.Table, "quot15", "Here are fifteen quotation marks: \"\"\"\"\"\"\"\"\"\"\"\"\"\"\""));
-    expect(checkS(parsed.Table, "apos15", "Here are fifteen apostrophes: '''''''''''''''"));
-    expect(checkS(parsed.Table, "str11", "'That's still pointless', she said."));
+    expect(checkS(parsed, "quot15", "Here are fifteen quotation marks: \"\"\"\"\"\"\"\"\"\"\"\"\"\"\""));
+    expect(checkS(parsed, "apos15", "Here are fifteen apostrophes: '''''''''''''''"));
+    expect(checkS(parsed, "str11", "'That's still pointless', she said."));
 }
 
 test "example9" {
@@ -1989,19 +2007,19 @@ test "example9" {
         \\bin1 = 0b11010110
     );
     defer parsed.deinit();
-    expect(getS(parsed.Table, "int1").?.value.Int == 99);
-    expect(getS(parsed.Table, "int2").?.value.Int == 42);
-    expect(getS(parsed.Table, "int3").?.value.Int == 0);
-    expect(getS(parsed.Table, "int4").?.value.Int == -17);
-    expect(getS(parsed.Table, "int5").?.value.Int == 1000);
-    expect(getS(parsed.Table, "int6").?.value.Int == 5349221);
-    expect(getS(parsed.Table, "int7").?.value.Int == 12345);
-    expect(getS(parsed.Table, "hex1").?.value.Int == 0xdeadbeef);
-    expect(getS(parsed.Table, "hex2").?.value.Int == 0xdeadbeef);
-    expect(getS(parsed.Table, "hex3").?.value.Int == 0xdeadbeef);
-    expect(getS(parsed.Table, "oct1").?.value.Int == 0o01234567);
-    expect(getS(parsed.Table, "oct2").?.value.Int == 0o755);
-    expect(getS(parsed.Table, "bin1").?.value.Int == 0b11010110);
+    expect(parsed.get("int1").?.Int == 99);
+    expect(parsed.get("int2").?.Int == 42);
+    expect(parsed.get("int3").?.Int == 0);
+    expect(parsed.get("int4").?.Int == -17);
+    expect(parsed.get("int5").?.Int == 1000);
+    expect(parsed.get("int6").?.Int == 5349221);
+    expect(parsed.get("int7").?.Int == 12345);
+    expect(parsed.get("hex1").?.Int == 0xdeadbeef);
+    expect(parsed.get("hex2").?.Int == 0xdeadbeef);
+    expect(parsed.get("hex3").?.Int == 0xdeadbeef);
+    expect(parsed.get("oct1").?.Int == 0o01234567);
+    expect(parsed.get("oct2").?.Int == 0o755);
+    expect(parsed.get("bin1").?.Int == 0b11010110);
 }
 
 test "examples10" {
@@ -2035,42 +2053,42 @@ test "examples10" {
     );
     defer parsed.deinit();
 
-    expect(getS(parsed.Table, "integers").?.value.Array.items[0].Int == 1);
-    expect(getS(parsed.Table, "integers").?.value.Array.items[1].Int == 2);
-    expect(getS(parsed.Table, "integers").?.value.Array.items[2].Int == 3);
-    expect(mem.eql(u8, getS(parsed.Table, "colors").?.value.Array.items[0].String.items, "red"));
-    expect(mem.eql(u8, getS(parsed.Table, "colors").?.value.Array.items[1].String.items, "yellow"));
-    expect(mem.eql(u8, getS(parsed.Table, "colors").?.value.Array.items[2].String.items, "green"));
-    expect(getS(parsed.Table, "nested_array_of_int").?.value.Array.items[0].Array.items[0].Int == 1);
-    expect(getS(parsed.Table, "nested_array_of_int").?.value.Array.items[0].Array.items[1].Int == 2);
-    expect(getS(parsed.Table, "nested_array_of_int").?.value.Array.items[1].Array.items[0].Int == 3);
-    expect(getS(parsed.Table, "nested_array_of_int").?.value.Array.items[1].Array.items[1].Int == 4);
-    expect(getS(parsed.Table, "nested_array_of_int").?.value.Array.items[1].Array.items[2].Int == 5);
-    expect(getS(parsed.Table, "nested_mixed_array").?.value.Array.items[0].Array.items[0].Int == 1);
-    expect(getS(parsed.Table, "nested_mixed_array").?.value.Array.items[0].Array.items[1].Int == 2);
-    expect(mem.eql(u8, getS(parsed.Table, "nested_mixed_array").?.value.Array.items[1].Array.items[0].String.items, "a"));
-    expect(mem.eql(u8, getS(parsed.Table, "nested_mixed_array").?.value.Array.items[1].Array.items[1].String.items, "b"));
-    expect(mem.eql(u8, getS(parsed.Table, "nested_mixed_array").?.value.Array.items[1].Array.items[2].String.items, "c"));
-    expect(mem.eql(u8, getS(parsed.Table, "string_array").?.value.Array.items[0].String.items, "all"));
-    expect(mem.eql(u8, getS(parsed.Table, "string_array").?.value.Array.items[1].String.items, "strings"));
-    expect(mem.eql(u8, getS(parsed.Table, "string_array").?.value.Array.items[2].String.items, "are the same"));
-    expect(mem.eql(u8, getS(parsed.Table, "string_array").?.value.Array.items[3].String.items, "type"));
-    expect(getS(parsed.Table, "numbers").?.value.Array.items[0].Float == 0.1);
-    expect(getS(parsed.Table, "numbers").?.value.Array.items[1].Float == 0.2);
-    expect(getS(parsed.Table, "numbers").?.value.Array.items[2].Float == 0.5);
-    expect(getS(parsed.Table, "numbers").?.value.Array.items[3].Int == 1);
-    expect(getS(parsed.Table, "numbers").?.value.Array.items[4].Int == 2);
-    expect(getS(parsed.Table, "numbers").?.value.Array.items[5].Int == 5);
-    expect(mem.eql(u8, getS(parsed.Table, "contributors").?.value.Array.items[0].String.items, "Foo Bar <foo@example.com>"));
-    expect(mem.eql(u8, getS(getS(parsed.Table, "contributors").?.value.Array.items[1].Table, "name").?.value.String.items, "Baz Qux"));
-    expect(mem.eql(u8, getS(getS(parsed.Table, "contributors").?.value.Array.items[1].Table, "email").?.value.String.items, "bazqux@example.com"));
-    expect(mem.eql(u8, getS(getS(parsed.Table, "contributors").?.value.Array.items[1].Table, "url").?.value.String.items, "https://example.com/bazqux"));
-    expect(getS(parsed.Table, "integers2").?.value.Array.items[0].Int == 1);
-    expect(getS(parsed.Table, "integers2").?.value.Array.items[1].Int == 2);
-    expect(getS(parsed.Table, "integers2").?.value.Array.items[2].Int == 3);
-    expect(getS(parsed.Table, "integers3").?.value.Array.items[0].Int == 1);
-    expect(getS(parsed.Table, "integers3").?.value.Array.items[1].Int == 2);
-    expect(getS(parsed.Table, "integers3").?.value.Array.items.len == 2);
+    expect(parsed.get("integers").?.idx(0).?.Int == 1);
+    expect(parsed.get("integers").?.Array.items[1].Int == 2);
+    expect(parsed.get("integers").?.Array.items[2].Int == 3);
+    expect(mem.eql(u8, parsed.get("colors").?.Array.items[0].String.items, "red"));
+    expect(mem.eql(u8, parsed.get("colors").?.Array.items[1].String.items, "yellow"));
+    expect(mem.eql(u8, parsed.get("colors").?.Array.items[2].String.items, "green"));
+    expect(parsed.get("nested_array_of_int").?.Array.items[0].Array.items[0].Int == 1);
+    expect(parsed.get("nested_array_of_int").?.Array.items[0].Array.items[1].Int == 2);
+    expect(parsed.get("nested_array_of_int").?.Array.items[1].Array.items[0].Int == 3);
+    expect(parsed.get("nested_array_of_int").?.Array.items[1].Array.items[1].Int == 4);
+    expect(parsed.get("nested_array_of_int").?.Array.items[1].Array.items[2].Int == 5);
+    expect(parsed.get("nested_mixed_array").?.Array.items[0].Array.items[0].Int == 1);
+    expect(parsed.get("nested_mixed_array").?.Array.items[0].Array.items[1].Int == 2);
+    expect(mem.eql(u8, parsed.get("nested_mixed_array").?.Array.items[1].Array.items[0].String.items, "a"));
+    expect(mem.eql(u8, parsed.get("nested_mixed_array").?.Array.items[1].Array.items[1].String.items, "b"));
+    expect(mem.eql(u8, parsed.get("nested_mixed_array").?.Array.items[1].Array.items[2].String.items, "c"));
+    expect(mem.eql(u8, parsed.get("string_array").?.Array.items[0].String.items, "all"));
+    expect(mem.eql(u8, parsed.get("string_array").?.Array.items[1].String.items, "strings"));
+    expect(mem.eql(u8, parsed.get("string_array").?.Array.items[2].String.items, "are the same"));
+    expect(mem.eql(u8, parsed.get("string_array").?.Array.items[3].String.items, "type"));
+    expect(parsed.get("numbers").?.Array.items[0].Float == 0.1);
+    expect(parsed.get("numbers").?.Array.items[1].Float == 0.2);
+    expect(parsed.get("numbers").?.Array.items[2].Float == 0.5);
+    expect(parsed.get("numbers").?.Array.items[3].Int == 1);
+    expect(parsed.get("numbers").?.Array.items[4].Int == 2);
+    expect(parsed.get("numbers").?.Array.items[5].Int == 5);
+    expect(mem.eql(u8, parsed.get("contributors").?.Array.items[0].String.items, "Foo Bar <foo@example.com>"));
+    expect(mem.eql(u8, parsed.get("contributors").?.Array.items[1].get("name").?.String.items, "Baz Qux"));
+    expect(mem.eql(u8, parsed.get("contributors").?.Array.items[1].get("email").?.String.items, "bazqux@example.com"));
+    expect(mem.eql(u8, parsed.get("contributors").?.Array.items[1].get("url").?.String.items, "https://example.com/bazqux"));
+    expect(parsed.get("integers2").?.Array.items[0].Int == 1);
+    expect(parsed.get("integers2").?.Array.items[1].Int == 2);
+    expect(parsed.get("integers2").?.Array.items[2].Int == 3);
+    expect(parsed.get("integers3").?.Array.items[0].Int == 1);
+    expect(parsed.get("integers3").?.Array.items[1].Int == 2);
+    expect(parsed.get("integers3").?.Array.items.len == 2);
 }
 
 test "example11" {
@@ -2101,17 +2119,17 @@ test "example11" {
         // \\smooth = true
     );
     defer parsed.deinit();
-    var tbl1 = getSV(parsed.Table, "table-1").?.Table;
+    var tbl1 = parsed.get("table-1").?;
     expect(checkS(tbl1, "key1", "some string"));
-    expect(getSV(tbl1, "key2").?.Int == 123);
-    var tbl2 = getSV(parsed.Table, "table-2").?.Table;
+    expect(tbl1.get("key2").?.Int == 123);
+    var tbl2 = parsed.get("table-2").?;
     expect(checkS(tbl2, "key1", "another string"));
-    expect(getSV(tbl2, "key2").?.Int == 456);
-    var taterman = getSV(getSV(parsed.Table, "dog").?.Table, "tater.man").?.Table;
-    expect(checkS(getSV(taterman, "type").?.Table, "name", "pug"));
-    var apple = getSV(getSV(parsed.Table, "fruit").?.Table, "apple").?.Table;
+    expect(tbl2.get("key2").?.Int == 456);
+    var taterman = parsed.get("dog").?.get("tater.man").?;
+    expect(checkS(taterman.get("type").?, "name", "pug"));
+    var apple = parsed.get("fruit").?.get("apple").?;
     expect(checkS(apple, "color", "red"));
-    expect(getSV(getSV(apple, "taste").?.Table, "sweet").?.Bool);
+    expect(apple.get("taste").?.get("sweet").?.Bool);
 }
 
 test "examples-invalid" {
