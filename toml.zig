@@ -861,7 +861,7 @@ pub const Parser = struct {
                 key.deinit();
                 return ParseError.DuplicatedKey;
             }
-            if (vtype != .None and !is_array) {
+            if (!is_array and vtype != .None) {
                 key.deinit();
                 return ParseError.DuplicatedKey;
             }
@@ -2182,6 +2182,18 @@ test "examples-invalid" {
         \\
         \\[fruit.apple]
         \\texture = "smooth"
+        ,
+        \\[fruit]
+        \\apple.color = "red"
+        \\apple.taste.sweet = true
+        \\[fruit.apple]  # INVALID
+        \\test = true
+        ,
+        \\[fruit]
+        \\apple.color = "red"
+        \\apple.taste.sweet = true
+        \\[fruit.apple.taste]  # INVALID
+        \\test = true
     };
     for (invalids) |invalid| {
         if (parser.parse(Value, invalid)) |parsed| {
