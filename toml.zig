@@ -844,10 +844,14 @@ pub const Parser = struct {
         try key.appendSlice(keys[0].items);
         var vtype = visited.visitedType(key);
         if (keys.len == 1) {
-            if (vtype == .Keyvalue)
+            if (vtype == .Keyvalue) {
+                key.deinit();
                 return ParseError.DuplicatedKey;
-            if (vtype != .None and !is_array)
+            }
+            if (vtype != .None and !is_array) {
+                key.deinit();
                 return ParseError.DuplicatedKey;
+            }
             if (T == Value) {
                 if (data.* != .Table) {
                     return ParseError.IncorrectDataType;   
