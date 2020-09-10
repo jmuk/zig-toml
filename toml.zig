@@ -711,6 +711,24 @@ pub const Parser = struct {
             .Bool => return self.parseBool(input, offset, v),
             .Int => return self.parseInt(input, offset, T, v),
             .Float => return self.parseFloat(input, offset, T, v),
+            .Enum => |e| {
+                if (input[offset] == '"' or input[offset] == '\'') {
+                    var s = Key.init(self.allocator);
+                    defer s.deinit();
+                    offset = try self.parseString(input, offset, &s);
+                    inline for (e.fields) |field| {
+                        if (mem.eql(u8, field.name, s.items)) {
+                            v.* = @intToEnum(T, field.value);
+                            return offset;
+                        }
+                    }
+                    return ParseError.IncorrectDataType;
+                }
+                var i: e.tag_type = 0;
+                offset = try self.parseInt(input, offset, e.tag_type, &i);
+                v.* = @intToEnum(T, i);
+                return offset;
+            },
             .Pointer => |ptr| {
                 if (ptr.size == .One) {
                     v.* = try self.allocator.create(ptr.child);
@@ -1328,8 +1346,12 @@ test "double-bracket-subtable" {
 }
 
 const fruit_physical = struct {
+    const fruit_shape = enum {
+        round, long, sphere,
+    };
+
     color: []u8,
-    shape: []u8,
+    shape: fruit_shape,
 };
 
 const fruit_variety = struct {
@@ -1345,7 +1367,7 @@ const fruit = struct {
     fn init(allocator: *mem.Allocator) fruit {
         return .{
             .name = "",
-            .physical = .{.color = "", .shape = ""},
+            .physical = .{.color = "", .shape = undefined},
             .variety = &[0]fruit_variety{},
             .allocator = allocator};
     }
@@ -1353,7 +1375,6 @@ const fruit = struct {
     fn deinit(self: fruit) void {
         self.allocator.free(self.name);
         self.allocator.free(self.physical.color);
-        self.allocator.free(self.physical.shape);
         for (self.variety) |v| {
             self.allocator.free(v.name);
         }
@@ -1393,7 +1414,7 @@ test "double-bracket-subtable-struct" {
     var apple = parsed.fruit[0];
     expect(mem.eql(u8, apple.name, "apple"));
     expect(mem.eql(u8, apple.physical.color, "red"));
-    expect(mem.eql(u8, apple.physical.shape, "round"));
+    expect(apple.physical.shape == .round);
     expect(apple.variety.len == 2);
     expect(mem.eql(u8, apple.variety[0].name, "red delicious"));
     expect(mem.eql(u8, apple.variety[1].name, "granny smith"));
